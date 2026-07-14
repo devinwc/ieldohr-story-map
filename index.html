@@ -32,12 +32,25 @@ const PALETTE = ["#e0555f", "#e8a33d", "#4fb8a0", "#5c8be0", "#b47ede", "#e07ab0
 const uid = () => Math.random().toString(36).slice(2, 10);
 
 const emptyData = {
-  locations: [],   // {id, name, x, y}
-  routes: [],      // {id, name, fromId, toId, points:[{x,y}], miles}
+  locations: [],   // {id, name, x, y} — named nodes
+  junctions: [],   // {id, x, y} — unnamed fork points along the path network
+  segments: [],    // {id, name, fromNodeId, toNodeId, points:[{x,y}], miles}
   calibration: null,
   characters: [],  // {id, name, color}
   points: [],      // {id, characterId, locationId, startDay, endDay, note}
+  timelineDays: 180,
+  timelineUnit: "days", // days | weeks | months
 };
+
+function migrateData(raw) {
+  const d = { ...emptyData, ...raw };
+  // older saves used a flat "routes" array of point-to-point paths — convert those to segments once
+  if ((!d.segments || d.segments.length === 0) && Array.isArray(raw.routes) && raw.routes.length > 0) {
+    d.segments = raw.routes.map((r) => ({ id: r.id, name: r.name, fromNodeId: r.fromId, toNodeId: r.toId, points: r.points, miles: r.miles }));
+  }
+  if (!d.junctions) d.junctions = [];
+  return d;
+}
 
 function dist(p1, p2) {
   const dx = ((p1.x - p2.x) / 100) * MAP_NATURAL_W;
@@ -60,6 +73,83 @@ function pointAtFraction(pts, t) {
   }
   return pts[pts.length - 1];
 }
+// closest point on a polyline to pt, in the same % coordinate space used for snapping
+function nearestPointOnPolyline(pt, pts) {
+  let best = { d: Infinity, point: pts[0], segIndex: 0 };
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1], b = pts[i];
+    const abx = b.x - a.x, aby = b.y - a.y;
+    const len2 = abx * abx + aby * aby;
+    let t = len2 === 0 ? 0 : ((pt.x - a.x) * abx + (pt.y - a.y) * aby) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const proj = { x: a.x + abx * t, y: a.y + aby * t };
+    const d = Math.hypot(proj.x - pt.x, proj.y - pt.y);
+    if (d < best.d) best = { d, point: proj, segIndex: i - 1 };
+  }
+  return best;
+}
+
+// ---- path network (locations + junctions connected by segments) ----------
+function nodeById(data, id) {
+  const loc = data.locations.find((l) => l.id === id);
+  if (loc) return loc;
+  return (data.junctions || []).find((j) => j.id === id) || null;
+}
+function buildGraph(data) {
+  const adj = {};
+  (data.segments || []).forEach((seg) => {
+    const w = seg.miles != null ? seg.miles : routeLengthPx(seg.points) * (data.calibration ? data.calibration.milesPerPixel : 0.05);
+    (adj[seg.fromNodeId] = adj[seg.fromNodeId] || []).push({ to: seg.toNodeId, w, segmentId: seg.id, reversed: false });
+    (adj[seg.toNodeId] = adj[seg.toNodeId] || []).push({ to: seg.fromNodeId, w, segmentId: seg.id, reversed: true });
+  });
+  return adj;
+}
+// returns ordered list of {segmentId, reversed} hops from fromId to toId, or null if unreachable
+function shortestPath(data, fromId, toId) {
+  if (fromId === toId) return [];
+  const adj = buildGraph(data);
+  const distMap = { [fromId]: 0 };
+  const prev = {};
+  const visited = new Set();
+  const queue = [[0, fromId]];
+  while (queue.length) {
+    queue.sort((a, b) => a[0] - b[0]);
+    const [d, u] = queue.shift();
+    if (visited.has(u)) continue;
+    visited.add(u);
+    if (u === toId) break;
+    (adj[u] || []).forEach((edge) => {
+      const nd = d + edge.w;
+      if (distMap[edge.to] === undefined || nd < distMap[edge.to]) {
+        distMap[edge.to] = nd;
+        prev[edge.to] = { from: u, segmentId: edge.segmentId, reversed: edge.reversed };
+        queue.push([nd, edge.to]);
+      }
+    });
+  }
+  if (distMap[toId] === undefined) return null;
+  const hops = [];
+  let cur = toId;
+  while (cur !== fromId) {
+    const p = prev[cur];
+    if (!p) return null;
+    hops.unshift({ segmentId: p.segmentId, reversed: p.reversed });
+    cur = p.from;
+  }
+  return hops;
+}
+function concatenatedPathPoints(data, fromId, toId) {
+  const hops = shortestPath(data, fromId, toId);
+  if (!hops || hops.length === 0) return null;
+  let pts = [];
+  hops.forEach((hop, idx) => {
+    const seg = data.segments.find((s) => s.id === hop.segmentId);
+    let segPts = seg.points;
+    if (hop.reversed) segPts = [...segPts].reverse();
+    pts = idx === 0 ? pts.concat(segPts) : pts.concat(segPts.slice(1));
+  });
+  return pts;
+}
 
 // ---- shared timeline logic -------------------------------------------------
 function pointsForChar(data, charId) {
@@ -79,15 +169,10 @@ function mapPositionForChar(data, charId, day) {
       const fromLoc = data.locations.find((l) => l.id === p.locationId);
       const toLoc = data.locations.find((l) => l.id === next.locationId);
       if (!fromLoc || !toLoc) return null;
-      const route = data.routes.find((r) =>
-        (r.fromId === p.locationId && r.toId === next.locationId) ||
-        (r.toId === p.locationId && r.fromId === next.locationId)
-      );
       const t = (day - p.endDay) / (next.startDay - p.endDay);
-      if (route) {
-        let rp = route.points;
-        if (route.fromId !== p.locationId) rp = [...rp].reverse();
-        const pt = pointAtFraction(rp, t);
+      const pathPts = concatenatedPathPoints(data, p.locationId, next.locationId);
+      if (pathPts) {
+        const pt = pointAtFraction(pathPts, t);
         return { x: pt.x, y: pt.y, label: "en route", note: "" };
       }
       return { x: fromLoc.x + (toLoc.x - fromLoc.x) * t, y: fromLoc.y + (toLoc.y - fromLoc.y) * t, label: "en route", note: "" };
@@ -173,7 +258,7 @@ function App() {
     if (!mapId) return;
     (async () => {
       const { data: row } = await supabase.from(TABLE).select("*").eq("id", mapId).single();
-      if (row) setData({ ...emptyData, ...row.data });
+      if (row) setData(migrateData(row.data));
       else { await supabase.from(TABLE).insert({ id: mapId, data: emptyData }); setData(emptyData); }
       firstLoad.current = true;
       setLoaded(true);
@@ -239,21 +324,58 @@ function App() {
     }
   }
 
+  const SNAP_THRESHOLD = 2; // % of image size
+
   function finishRoute() {
     if (routeDraft.length < 2) { setRouteDraft([]); setMode("view"); return; }
-    const first = routeDraft[0], last = routeDraft[routeDraft.length - 1];
-    const nearest = (p) => {
+
+    let junctions = data.junctions || [];
+    let segments = data.segments || [];
+
+    function resolveEndpoint(pt) {
       let best = null, bestD = Infinity;
-      data.locations.forEach((loc) => { const d = dist(p, loc); if (d < bestD) { bestD = d; best = loc; } });
-      return best;
-    };
-    const fromLoc = nearest(first), toLoc = nearest(last);
-    if (!fromLoc || !toLoc) { alert("Place location pins near both ends of this route first."); setRouteDraft([]); setMode("view"); return; }
-    const name = prompt(`Route name (connecting ${fromLoc.name} — ${toLoc.name}):`, `${fromLoc.name} – ${toLoc.name}`);
+      data.locations.forEach((l) => { const d = Math.hypot(l.x - pt.x, l.y - pt.y); if (d < SNAP_THRESHOLD && d < bestD) { bestD = d; best = l.id; } });
+      if (best) return { nodeId: best, name: data.locations.find((l) => l.id === best).name };
+      junctions.forEach((j) => { const d = Math.hypot(j.x - pt.x, j.y - pt.y); if (d < SNAP_THRESHOLD && d < bestD) { bestD = d; best = j.id; } });
+      if (best) return { nodeId: best, name: "junction" };
+
+      // try snapping onto an existing segment's path — this is what creates a fork
+      let segBest = null, segBestD = Infinity;
+      segments.forEach((seg) => {
+        const np = nearestPointOnPolyline(pt, seg.points);
+        if (np.d < SNAP_THRESHOLD && np.d < segBestD) { segBestD = np.d; segBest = { seg, np }; }
+      });
+      if (segBest) {
+        const { seg, np } = segBest;
+        const newJ = { id: uid(), x: np.point.x, y: np.point.y };
+        junctions = [...junctions, newJ];
+        const before = seg.points.slice(0, np.segIndex + 1).concat([np.point]);
+        const after = [np.point].concat(seg.points.slice(np.segIndex + 1));
+        const milesA = data.calibration ? routeLengthPx(before) * data.calibration.milesPerPixel : null;
+        const milesB = data.calibration ? routeLengthPx(after) * data.calibration.milesPerPixel : null;
+        segments = segments.filter((s) => s.id !== seg.id).concat([
+          { id: uid(), name: seg.name, fromNodeId: seg.fromNodeId, toNodeId: newJ.id, points: before, miles: milesA },
+          { id: uid(), name: seg.name, fromNodeId: newJ.id, toNodeId: seg.toNodeId, points: after, miles: milesB },
+        ]);
+        return { nodeId: newJ.id, name: "fork of " + seg.name };
+      }
+
+      // nothing nearby — drop a brand new (unnamed) junction right here
+      const newJ = { id: uid(), x: pt.x, y: pt.y };
+      junctions = [...junctions, newJ];
+      return { nodeId: newJ.id, name: "junction" };
+    }
+
+    const from = resolveEndpoint(routeDraft[0]);
+    const to = resolveEndpoint(routeDraft[routeDraft.length - 1]);
+    if (from.nodeId === to.nodeId) { alert("Start and end of this path landed on the same point — draw between two distinct points."); setRouteDraft([]); setMode("view"); return; }
+
+    const name = prompt(`Path name (connecting ${from.name} — ${to.name}):`, `${from.name} – ${to.name}`);
     if (name === null) { setRouteDraft([]); setMode("view"); return; }
-    const px = routeLengthPx(routeDraft);
-    const miles = data.calibration ? px * data.calibration.milesPerPixel : null;
-    update({ routes: [...data.routes, { id: uid(), name: name || `${fromLoc.name} – ${toLoc.name}`, fromId: fromLoc.id, toId: toLoc.id, points: routeDraft, miles }] });
+    const miles = data.calibration ? routeLengthPx(routeDraft) * data.calibration.milesPerPixel : null;
+    segments = [...segments, { id: uid(), name: name || `${from.name} – ${to.name}`, fromNodeId: from.nodeId, toNodeId: to.nodeId, points: routeDraft, miles }];
+
+    update({ junctions, segments });
     setRouteDraft([]); setMode("view");
   }
 
@@ -278,7 +400,15 @@ function App() {
     if (editingPointId === pointId) setEditingPointId(null);
   }
 
-  const maxDay = useMemo(() => data.points.reduce((m, p) => Math.max(m, p.endDay), 1), [data.points]);
+  const pointsMaxDay = useMemo(() => data.points.reduce((m, p) => Math.max(m, p.endDay), 1), [data.points]);
+  const maxDay = Math.max(pointsMaxDay, data.timelineDays || 1);
+
+  const UNIT_DAYS = { days: 1, weeks: 7, months: 30 };
+  function formatDay(d) {
+    if (data.timelineUnit === "weeks") return `Week ${(d / 7).toFixed(1)} (day ${d})`;
+    if (data.timelineUnit === "months") return `Month ${(d / 30).toFixed(1)} (day ${d})`;
+    return `Day ${d}`;
+  }
 
   // ---- thread diagram computation ----
   const LANE_H = 56, DAY_W = 26, LEFT_PAD = 90, TOP_PAD = 30, BOTTOM_PAD = 30;
@@ -413,10 +543,11 @@ function App() {
               <div style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, transformOrigin: "0 0", width: "100%", position: "relative" }}>
                 <img ref={imgRef} src={MAP_IMAGE} alt="map" className="w-full block select-none" draggable={false} onClick={handleMapClick} />
                 <svg className="absolute inset-0 w-full h-full pointer-events-none" viewBox="0 0 100 100" preserveAspectRatio="none">
-                  {data.routes.map((r) => (
+                  {data.segments.map((r) => (
                     <polyline key={r.id} points={r.points.map((p) => `${p.x},${p.y}`).join(" ")} fill="none" stroke="#8f8a7f" strokeWidth="0.3" strokeDasharray="1 1" vectorEffect="non-scaling-stroke" />
                   ))}
                   {routeDraft.length > 0 && <polyline points={routeDraft.map((p) => `${p.x},${p.y}`).join(" ")} fill="none" stroke="#4fb8a0" strokeWidth="0.4" vectorEffect="non-scaling-stroke" />}
+                  {(data.junctions || []).map((j) => <circle key={j.id} cx={j.x} cy={j.y} r="0.35" fill="#e8a33d" stroke="#15151a" strokeWidth="0.1" />)}
                   {data.locations.map((l) => <circle key={l.id} cx={l.x} cy={l.y} r="0.6" fill="#ece7dd" stroke="#15151a" strokeWidth="0.15" />)}
                   {currentPositions.map(({ c, pos }) => pos && <circle key={c.id} cx={pos.x} cy={pos.y} r="1" fill={c.color} stroke="#15151a" strokeWidth="0.2" />)}
                 </svg>
@@ -445,8 +576,32 @@ function App() {
             )}
 
             <div className="mt-4 border border-[#3a3a44] rounded p-4">
+              <div className="flex flex-wrap items-center gap-3 mb-3 font-mono text-xs text-[#8f8a7f]">
+                <span className="flex items-center gap-1">
+                  {["days", "weeks", "months"].map((u) => (
+                    <button key={u} onClick={() => update({ timelineUnit: u })}
+                      className="px-2 py-1 rounded border capitalize"
+                      style={{ borderColor: data.timelineUnit === u ? "#ece7dd" : "#3a3a44", color: data.timelineUnit === u ? "#ece7dd" : "#8f8a7f" }}>
+                      {u}
+                    </button>
+                  ))}
+                </span>
+                <span className="flex items-center gap-1">
+                  timeline length
+                  <input type="number" min="1" value={Math.round(data.timelineDays / UNIT_DAYS[data.timelineUnit])}
+                    onChange={(e) => update({ timelineDays: Math.max(1, parseInt(e.target.value) || 1) * UNIT_DAYS[data.timelineUnit] })}
+                    className="w-16 bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1" />
+                  {data.timelineUnit}
+                </span>
+                <span className="flex items-center gap-1">
+                  go to day
+                  <input type="number" min="1" value={day}
+                    onChange={(e) => setDay(Math.max(1, parseInt(e.target.value) || 1))}
+                    className="w-16 bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1" />
+                </span>
+              </div>
               <div className="flex items-center gap-3 mb-2 font-mono text-xs">
-                <span>Day {day}</span>
+                <span className="whitespace-nowrap">{formatDay(day)}</span>
                 <input type="range" min="1" max={maxDay} value={day} onChange={(e) => setDay(parseInt(e.target.value))} className="flex-1" />
                 <button onClick={() => setPlaying((p) => !p)} className="px-2 py-1 border border-[#3a3a44] rounded">{playing ? "Pause" : "Play"}</button>
               </div>
@@ -521,10 +676,16 @@ function App() {
               </div>
             </div>
             <div>
-              <h2 className="text-base mb-2">Routes ({data.routes.length})</h2>
+              <h2 className="text-base mb-2">Paths ({data.segments.length})</h2>
               <div className="text-xs text-[#8f8a7f] max-h-32 overflow-y-auto space-y-0.5">
-                {data.routes.map((r) => <div key={r.id}>{r.name}{r.miles ? ` — ${r.miles.toFixed(0)}mi` : ""}</div>)}
+                {data.segments.map((r) => {
+                  const fromN = nodeById(data, r.fromNodeId), toN = nodeById(data, r.toNodeId);
+                  const fromName = fromN ? (fromN.name || "junction") : "?";
+                  const toName = toN ? (toN.name || "junction") : "?";
+                  return <div key={r.id}>{r.name}: {fromName} — {toName}{r.miles ? ` (${r.miles.toFixed(0)}mi)` : ""}</div>;
+                })}
               </div>
+              <p className="text-[10px] text-[#8f8a7f] mt-1">amber dots on the map are fork points where paths split</p>
             </div>
           </div>
         </div>
