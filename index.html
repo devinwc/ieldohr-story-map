@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Ieldohr Story Map</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/@supabase/supabase-js@2"></script>
+</head>
+<body class="bg-[#15151a]">
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useMemo, useRef } = React;
+
+// ---------------------------------------------------------------
+// SUPABASE CONFIG
+// ---------------------------------------------------------------
+const SUPABASE_URL = "https://qusqdgagnmsghysuidau.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InF1c3FkZ2Fnbm1zZ2h5c3VpZGF1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM5ODYxMjgsImV4cCI6MjA5OTU2MjEyOH0.i8PfGYpjnzQlmrtSuf22snJIu2GD0p_NX2ztu5zlCrY";
+const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const TABLE = "story_world";
+
+const MAP_IMAGE = "Ieldohr_Map.webp";
+const MAP_NATURAL_W = 2048;
+const MAP_NATURAL_H = 1536;
+
+const PALETTE = ["#e0555f", "#e8a33d", "#4fb8a0", "#5c8be0", "#b47ede", "#e07ab0", "#8fd15a", "#d9c23d"];
+const uid = () => Math.random().toString(36).slice(2, 10);
+
+const emptyData = {
+  locations: [],   // {id, name, x, y}
+  routes: [],      // {id, name, fromId, toId, points:[{x,y}], miles}
+  calibration: null,
+  characters: [],  // {id, name, color}
+  points: [],      // {id, characterId, locationId, startDay, endDay, note}
+};
+
+function dist(p1, p2) {
+  const dx = ((p1.x - p2.x) / 100) * MAP_NATURAL_W;
+  const dy = ((p1.y - p2.y) / 100) * MAP_NATURAL_H;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+function routeLengthPx(pts) { let t = 0; for (let i = 1; i < pts.length; i++) t += dist(pts[i - 1], pts[i]); return t; }
+function pointAtFraction(pts, t) {
+  const segLens = []; let total = 0;
+  for (let i = 1; i < pts.length; i++) { const d = dist(pts[i - 1], pts[i]); segLens.push(d); total += d; }
+  if (total === 0) return pts[0];
+  let target = t * total;
+  for (let i = 0; i < segLens.length; i++) {
+    if (target <= segLens[i] || i === segLens.length - 1) {
+      const frac = segLens[i] === 0 ? 0 : Math.min(target / segLens[i], 1);
+      const a = pts[i], b = pts[i + 1];
+      return { x: a.x + (b.x - a.x) * frac, y: a.y + (b.y - a.y) * frac };
+    }
+    target -= segLens[i];
+  }
+  return pts[pts.length - 1];
+}
+
+// ---- shared timeline logic -------------------------------------------------
+function pointsForChar(data, charId) {
+  return data.points.filter((p) => p.characterId === charId).sort((a, b) => a.startDay - b.startDay);
+}
+
+function mapPositionForChar(data, charId, day) {
+  const pts = pointsForChar(data, charId);
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i];
+    if (day >= p.startDay && day <= p.endDay) {
+      const loc = data.locations.find((l) => l.id === p.locationId);
+      return loc ? { x: loc.x, y: loc.y, label: loc.name, note: p.note } : null;
+    }
+    const next = pts[i + 1];
+    if (next && day > p.endDay && day < next.startDay && p.locationId !== next.locationId) {
+      const fromLoc = data.locations.find((l) => l.id === p.locationId);
+      const toLoc = data.locations.find((l) => l.id === next.locationId);
+      if (!fromLoc || !toLoc) return null;
+      const route = data.routes.find((r) =>
+        (r.fromId === p.locationId && r.toId === next.locationId) ||
+        (r.toId === p.locationId && r.fromId === next.locationId)
+      );
+      const t = (day - p.endDay) / (next.startDay - p.endDay);
+      if (route) {
+        let rp = route.points;
+        if (route.fromId !== p.locationId) rp = [...rp].reverse();
+        const pt = pointAtFraction(rp, t);
+        return { x: pt.x, y: pt.y, label: "en route", note: "" };
+      }
+      return { x: fromLoc.x + (toLoc.x - fromLoc.x) * t, y: fromLoc.y + (toLoc.y - fromLoc.y) * t, label: "en route", note: "" };
+    }
+  }
+  return null;
+}
+
+// which locationId (if any) a character is stationed at on a given day (null if traveling/absent)
+function stationedLocation(data, charId, day) {
+  const pts = pointsForChar(data, charId);
+  const hit = pts.find((p) => day >= p.startDay && day <= p.endDay);
+  return hit ? hit.locationId : null;
+}
+
+function SetupScreen({ onOpen }) {
+  const [val, setVal] = useState("");
+  return (
+    <div className="min-h-screen bg-[#15151a] text-[#ece7dd] flex items-center justify-center px-6">
+      <div className="max-w-sm w-full">
+        <h1 className="text-2xl mb-2" style={{ fontFamily: "Georgia, serif" }}>Ieldohr Story Map</h1>
+        <p className="text-sm text-[#8f8a7f] font-mono mb-6">Enter a map name. Use the same one on every device to sync.</p>
+        <input value={val} onChange={(e) => setVal(e.target.value)} placeholder="e.g. ieldohr-main"
+          className="w-full bg-[#1c1c22] border border-[#3a3a44] rounded px-3 py-2 text-sm mb-3"
+          onKeyDown={(e) => e.key === "Enter" && val.trim() && onOpen(val.trim())} />
+        <button onClick={() => val.trim() && onOpen(val.trim())}
+          className="w-full px-3 py-2 text-sm border border-[#3a3a44] rounded hover:border-[#8f8a7f] transition">Open map</button>
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [mapId, setMapId] = useState(() => localStorage.getItem("storyWorldId") || null);
+  const [data, setData] = useState(emptyData);
+  const [loaded, setLoaded] = useState(false);
+  const [status, setStatus] = useState("idle");
+  const [configError, setConfigError] = useState(false);
+  const saveTimer = useRef(null);
+  const firstLoad = useRef(true);
+
+  const [mode, setMode] = useState("view"); // view | calibrate | pin | route | point
+  const [calibPoints, setCalibPoints] = useState([]);
+  const [routeDraft, setRouteDraft] = useState([]);
+  const [selectedChar, setSelectedChar] = useState(null);
+  const [editingPointId, setEditingPointId] = useState(null);
+  const [day, setDay] = useState(1);
+  const [playing, setPlaying] = useState(false);
+
+  const imgRef = useRef(null);
+
+  useEffect(() => {
+    if (SUPABASE_URL.includes("YOUR_SUPABASE") || SUPABASE_ANON_KEY.includes("YOUR_SUPABASE")) setConfigError(true);
+  }, []);
+
+  useEffect(() => {
+    if (!mapId) return;
+    (async () => {
+      const { data: row } = await supabase.from(TABLE).select("*").eq("id", mapId).single();
+      if (row) setData({ ...emptyData, ...row.data });
+      else { await supabase.from(TABLE).insert({ id: mapId, data: emptyData }); setData(emptyData); }
+      firstLoad.current = true;
+      setLoaded(true);
+    })();
+  }, [mapId]);
+
+  useEffect(() => {
+    if (!loaded || !mapId) return;
+    if (firstLoad.current) { firstLoad.current = false; return; }
+    setStatus("saving");
+    clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(async () => {
+      const { error } = await supabase.from(TABLE).update({ data, updated_at: new Date().toISOString() }).eq("id", mapId);
+      setStatus(error ? "error" : "saved");
+    }, 700);
+  }, [data]);
+
+  useEffect(() => {
+    if (!playing) return;
+    const t = setInterval(() => setDay((d) => d + 1), 500);
+    return () => clearInterval(t);
+  }, [playing]);
+
+  function openMap(id) { localStorage.setItem("storyWorldId", id); setMapId(id); }
+  function switchMap() { localStorage.removeItem("storyWorldId"); setMapId(null); setLoaded(false); setData(emptyData); }
+  function update(patch) { setData((d) => ({ ...d, ...patch })); }
+
+  function handleMapClick(e) {
+    const rect = imgRef.current.getBoundingClientRect();
+    const x = ((e.clientX - rect.left) / rect.width) * 100;
+    const y = ((e.clientY - rect.top) / rect.height) * 100;
+
+    if (mode === "calibrate") {
+      const pts = [...calibPoints, { x, y }];
+      if (pts.length === 2) {
+        const miles = prompt("Real-world distance between these two points, in miles:");
+        if (miles && !isNaN(parseFloat(miles))) {
+          const px = dist(pts[0], pts[1]);
+          update({ calibration: { milesPerPixel: parseFloat(miles) / px } });
+        }
+        setCalibPoints([]); setMode("view");
+      } else setCalibPoints(pts);
+    } else if (mode === "pin") {
+      const name = prompt("Location name:");
+      if (name && name.trim()) update({ locations: [...data.locations, { id: uid(), name: name.trim(), x, y }] });
+      setMode("view");
+    } else if (mode === "route") {
+      setRouteDraft((pts) => [...pts, { x, y }]);
+    } else if (mode === "point") {
+      if (!selectedChar) { alert("Select a character in the sidebar first."); return; }
+      const threshold = 2; // % distance tolerance to snap to existing pin
+      let loc = data.locations.find((l) => Math.hypot(l.x - x, l.y - y) < threshold);
+      if (!loc) {
+        const name = prompt("New location name (you clicked an unpinned spot):");
+        if (!name || !name.trim()) return;
+        loc = { id: uid(), name: name.trim(), x, y };
+        update({ locations: [...data.locations, loc] });
+      }
+      const newPoint = { id: uid(), characterId: selectedChar, locationId: loc.id, startDay: day, endDay: day, note: "" };
+      setData((d) => ({ ...d, points: [...d.points, newPoint], locations: d.locations.some(l => l.id === loc.id) ? d.locations : [...d.locations, loc] }));
+      setEditingPointId(newPoint.id);
+    }
+  }
+
+  function finishRoute() {
+    if (routeDraft.length < 2) { setRouteDraft([]); setMode("view"); return; }
+    const first = routeDraft[0], last = routeDraft[routeDraft.length - 1];
+    const nearest = (p) => {
+      let best = null, bestD = Infinity;
+      data.locations.forEach((loc) => { const d = dist(p, loc); if (d < bestD) { bestD = d; best = loc; } });
+      return best;
+    };
+    const fromLoc = nearest(first), toLoc = nearest(last);
+    if (!fromLoc || !toLoc) { alert("Place location pins near both ends of this route first."); setRouteDraft([]); setMode("view"); return; }
+    const name = prompt(`Route name (connecting ${fromLoc.name} — ${toLoc.name}):`, `${fromLoc.name} – ${toLoc.name}`);
+    if (name === null) { setRouteDraft([]); setMode("view"); return; }
+    const px = routeLengthPx(routeDraft);
+    const miles = data.calibration ? px * data.calibration.milesPerPixel : null;
+    update({ routes: [...data.routes, { id: uid(), name: name || `${fromLoc.name} – ${toLoc.name}`, fromId: fromLoc.id, toId: toLoc.id, points: routeDraft, miles }] });
+    setRouteDraft([]); setMode("view");
+  }
+
+  function addCharacter(name) {
+    if (!name.trim()) return;
+    const color = PALETTE[data.characters.length % PALETTE.length];
+    update({ characters: [...data.characters, { id: uid(), name: name.trim(), color }] });
+  }
+  function removeCharacter(id) {
+    update({ characters: data.characters.filter((c) => c.id !== id), points: data.points.filter((p) => p.characterId !== id) });
+    if (selectedChar === id) setSelectedChar(null);
+  }
+
+  function addPointForm(charId, locationId, startDay, endDay, note) {
+    update({ points: [...data.points, { id: uid(), characterId: charId, locationId, startDay, endDay, note }] });
+  }
+  function updatePoint(pointId, patch) {
+    update({ points: data.points.map((p) => (p.id === pointId ? { ...p, ...patch } : p)) });
+  }
+  function removePoint(pointId) {
+    update({ points: data.points.filter((p) => p.id !== pointId) });
+    if (editingPointId === pointId) setEditingPointId(null);
+  }
+
+  const maxDay = useMemo(() => data.points.reduce((m, p) => Math.max(m, p.endDay), 1), [data.points]);
+
+  // ---- thread diagram computation ----
+  const LANE_H = 56, DAY_W = 26, LEFT_PAD = 90, TOP_PAD = 30, BOTTOM_PAD = 30;
+  const threadLayout = useMemo(() => {
+    if (data.characters.length === 0 || data.points.length === 0) return { paths: [], bubbles: [], width: 400, height: 200 };
+    const homeLane = (charId) => data.characters.findIndex((c) => c.id === charId);
+
+    // global breakpoints: every startDay and endDay+1 across all points
+    const breakSet = new Set();
+    data.points.forEach((p) => { breakSet.add(p.startDay); breakSet.add(p.endDay + 1); });
+    const breaks = Array.from(breakSet).sort((a, b) => a - b);
+
+    function laneYFor(charId, dayVal) {
+      const loc = stationedLocation(data, charId, dayVal);
+      if (loc == null) return null;
+      const group = data.characters.filter((c) => stationedLocation(data, c.id, dayVal) === loc);
+      const avgLane = group.reduce((s, c) => s + homeLane(c.id), 0) / group.length;
+      return { y: TOP_PAD + avgLane * LANE_H, group, loc };
+    }
+
+    const paths = data.characters.map((ch) => {
+      const pts = pointsForChar(data, ch.id);
+      if (pts.length === 0) return { ch, pts: [] };
+      const minD = pts[0].startDay, maxD = pts[pts.length - 1].endDay;
+      const cols = breaks.filter((b) => b >= minD && b <= maxD);
+      const verts = cols.map((d) => {
+        const info = laneYFor(ch.id, d);
+        const y = info ? info.y : TOP_PAD + homeLane(ch.id) * LANE_H;
+        return { x: LEFT_PAD + (d - breaks[0]) * DAY_W, y, day: d };
+      });
+      return { ch, pts: verts };
+    });
+
+    const bubbleMap = new Map();
+    breaks.forEach((d) => {
+      const present = data.characters.filter((c) => stationedLocation(data, c.id, d) != null);
+      const byLoc = {};
+      present.forEach((c) => {
+        const loc = stationedLocation(data, c.id, d);
+        (byLoc[loc] = byLoc[loc] || []).push(c);
+      });
+      Object.entries(byLoc).forEach(([locId, chars]) => {
+        if (chars.length > 1) {
+          const avgLane = chars.reduce((s, c) => s + homeLane(c.id), 0) / chars.length;
+          const key = `${d}-${locId}`;
+          const colors = chars.map((c) => c.color);
+          const locName = data.locations.find((l) => l.id === locId)?.name || "";
+          bubbleMap.set(key, { x: LEFT_PAD + (d - breaks[0]) * DAY_W, y: TOP_PAD + avgLane * LANE_H, colors, locName });
+        }
+      });
+    });
+
+    const width = LEFT_PAD + (breaks[breaks.length - 1] - breaks[0]) * DAY_W + 60;
+    const height = TOP_PAD + Math.max(data.characters.length - 1, 0) * LANE_H + BOTTOM_PAD + TOP_PAD;
+    return { paths, bubbles: Array.from(bubbleMap.values()), width, height, dayToX: (d) => LEFT_PAD + (d - breaks[0]) * DAY_W };
+  }, [data]);
+
+  function pathD(pts) {
+    if (pts.length === 0) return "";
+    if (pts.length === 1) return `M ${pts[0].x} ${pts[0].y}`;
+    let d = `M ${pts[0].x} ${pts[0].y}`;
+    for (let i = 1; i < pts.length; i++) {
+      const midX = (pts[i - 1].x + pts[i].x) / 2;
+      d += ` C ${midX} ${pts[i - 1].y}, ${midX} ${pts[i].y}, ${pts[i].x} ${pts[i].y}`;
+    }
+    return d;
+  }
+  function blend(hexes) {
+    const rgbs = hexes.map((h) => [parseInt(h.slice(1,3),16), parseInt(h.slice(3,5),16), parseInt(h.slice(5,7),16)]);
+    const n = rgbs.length;
+    return `rgb(${Math.round(rgbs.reduce((s,c)=>s+c[0],0)/n)}, ${Math.round(rgbs.reduce((s,c)=>s+c[1],0)/n)}, ${Math.round(rgbs.reduce((s,c)=>s+c[2],0)/n)})`;
+  }
+
+  if (configError) {
+    return (
+      <div className="min-h-screen bg-[#15151a] text-[#ece7dd] flex items-center justify-center px-6">
+        <div className="max-w-md text-sm font-mono leading-relaxed">
+          <p className="mb-2 text-[#e0555f]">Supabase isn't configured yet.</p>
+          <p className="text-[#8f8a7f]">Fill in SUPABASE_URL and SUPABASE_ANON_KEY near the top of the script.</p>
+        </div>
+      </div>
+    );
+  }
+  if (!mapId) return <SetupScreen onOpen={openMap} />;
+  if (!loaded) return <div className="min-h-screen bg-[#15151a] text-[#8f8a7f] flex items-center justify-center font-mono text-sm">Loading map…</div>;
+
+  const currentPositions = data.characters.map((c) => ({ c, pos: mapPositionForChar(data, c.id, day) }));
+  const editingPoint = data.points.find((p) => p.id === editingPointId);
+
+  return (
+    <div className="min-h-screen bg-[#15151a] text-[#ece7dd] font-serif">
+      <div className="max-w-[1600px] mx-auto px-6 py-8">
+        <div className="flex items-end justify-between mb-6 border-b border-[#3a3a44] pb-4">
+          <div>
+            <h1 className="text-3xl tracking-tight" style={{ fontFamily: "Georgia, serif" }}>Ieldohr Story Map</h1>
+            <p className="text-sm text-[#8f8a7f] mt-1 font-mono">map: {mapId} · {status === "saving" ? "saving…" : status === "saved" ? "synced" : status === "error" ? "save failed" : ""}</p>
+          </div>
+          <button onClick={switchMap} className="px-3 py-1.5 text-xs font-mono border border-[#3a3a44] rounded hover:border-[#8f8a7f] transition">Switch map</button>
+        </div>
+
+        <div className="grid lg:grid-cols-[1fr_360px] gap-6">
+          <div>
+            <div className="flex flex-wrap gap-2 mb-3 font-mono text-xs">
+              {["view", "calibrate", "pin", "route", "point"].map((m) => (
+                <button key={m} onClick={() => { setMode(m); setCalibPoints([]); setRouteDraft([]); }}
+                  className="px-3 py-1.5 rounded border transition"
+                  style={{ borderColor: mode === m ? "#ece7dd" : "#3a3a44", background: mode === m ? "#ece7dd22" : "transparent" }}>
+                  {m === "view" ? "View" : m === "calibrate" ? "Calibrate scale" : m === "pin" ? "Add pin" : m === "route" ? "Draw route" : "Add point (click map)"}
+                </button>
+              ))}
+              {mode === "route" && <button onClick={finishRoute} className="px-3 py-1.5 rounded border border-[#4fb8a0] text-[#4fb8a0]">Finish route ({routeDraft.length} pts)</button>}
+              {mode === "point" && <span className="px-3 py-1.5 text-[#8f8a7f]">active: {data.characters.find(c=>c.id===selectedChar)?.name || "select a character →"} · day {day}</span>}
+              {data.calibration && <span className="px-3 py-1.5 text-[#8f8a7f]">1px ≈ {data.calibration.milesPerPixel.toFixed(3)} mi</span>}
+            </div>
+
+            <div className="relative border border-[#3a3a44] rounded overflow-hidden bg-[#0f0f13]" style={{ cursor: mode === "view" ? "default" : "crosshair" }}>
+              <img ref={imgRef} src={MAP_IMAGE} alt="map" className="w-full block select-none" draggable={false} onClick={handleMapClick} />
+              <svg className="absolute inset-0 w-full h-full pointer-events-none" viewBox="0 0 100 100" preserveAspectRatio="none">
+                {data.routes.map((r) => (
+                  <polyline key={r.id} points={r.points.map((p) => `${p.x},${p.y}`).join(" ")} fill="none" stroke="#8f8a7f" strokeWidth="0.3" strokeDasharray="1 1" vectorEffect="non-scaling-stroke" />
+                ))}
+                {routeDraft.length > 0 && <polyline points={routeDraft.map((p) => `${p.x},${p.y}`).join(" ")} fill="none" stroke="#4fb8a0" strokeWidth="0.4" vectorEffect="non-scaling-stroke" />}
+                {data.locations.map((l) => <circle key={l.id} cx={l.x} cy={l.y} r="0.6" fill="#ece7dd" stroke="#15151a" strokeWidth="0.15" />)}
+                {currentPositions.map(({ c, pos }) => pos && <circle key={c.id} cx={pos.x} cy={pos.y} r="1" fill={c.color} stroke="#15151a" strokeWidth="0.2" />)}
+              </svg>
+              {data.locations.map((l) => (
+                <div key={l.id} className="absolute text-[10px] font-mono text-[#ece7dd] bg-[#15151a]/70 px-1 rounded pointer-events-none"
+                  style={{ left: `${l.x}%`, top: `${l.y}%`, transform: "translate(6px, -50%)" }}>{l.name}</div>
+              ))}
+            </div>
+
+            {editingPoint && (
+              <div className="mt-3 border border-[#4fb8a0] rounded p-3 text-xs space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="font-mono text-[#8f8a7f]">Editing point at {data.locations.find(l=>l.id===editingPoint.locationId)?.name}</span>
+                  <button onClick={() => setEditingPointId(null)} className="text-[#8f8a7f] hover:text-[#ece7dd]">done ✕</button>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[#8f8a7f]">days</span>
+                  <input type="number" value={editingPoint.startDay} onChange={(e) => updatePoint(editingPoint.id, { startDay: parseInt(e.target.value) || 1 })} className="w-16 bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1" />
+                  <span>–</span>
+                  <input type="number" value={editingPoint.endDay} onChange={(e) => updatePoint(editingPoint.id, { endDay: parseInt(e.target.value) || 1 })} className="w-16 bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1" />
+                </div>
+                <textarea value={editingPoint.note} onChange={(e) => updatePoint(editingPoint.id, { note: e.target.value })} placeholder="What's happening here…" className="w-full bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1.5 h-16" />
+              </div>
+            )}
+
+            <div className="mt-4 border border-[#3a3a44] rounded p-4">
+              <div className="flex items-center gap-3 mb-2 font-mono text-xs">
+                <span>Day {day}</span>
+                <input type="range" min="1" max={maxDay} value={day} onChange={(e) => setDay(parseInt(e.target.value))} className="flex-1" />
+                <button onClick={() => setPlaying((p) => !p)} className="px-2 py-1 border border-[#3a3a44] rounded">{playing ? "Pause" : "Play"}</button>
+              </div>
+              <div className="flex flex-wrap gap-3 text-xs">
+                {currentPositions.map(({ c, pos }) => (
+                  <div key={c.id} className="flex items-center gap-1.5">
+                    <span className="w-2.5 h-2.5 rounded-full inline-block" style={{ background: c.color }} />
+                    {c.name}: <span className="text-[#8f8a7f]">{pos ? pos.label : "—"}</span>
+                    {pos?.note && <span className="text-[#8f8a7f] italic">— {pos.note}</span>}
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Thread diagram */}
+            <div className="mt-6">
+              <h2 className="text-base mb-2">Character threads</h2>
+              <div className="border border-[#3a3a44] rounded bg-[#191920] overflow-x-auto">
+                <svg width={Math.max(threadLayout.width, 400)} height={threadLayout.height} className="block">
+                  {threadLayout.dayToX && (
+                    <line x1={threadLayout.dayToX(day)} y1={0} x2={threadLayout.dayToX(day)} y2={threadLayout.height} stroke="#e8a33d" strokeWidth="1" opacity="0.5" />
+                  )}
+                  {threadLayout.paths.map(({ ch, pts }) => (
+                    <path key={ch.id} d={pathD(pts)} fill="none" stroke={ch.color} strokeWidth="3" strokeLinecap="round" opacity="0.9" />
+                  ))}
+                  {threadLayout.bubbles.map((b, i) => (
+                    <g key={i}>
+                      <circle cx={b.x} cy={b.y} r={9 + b.colors.length * 1.5} fill={blend(b.colors)} opacity="0.85" />
+                    </g>
+                  ))}
+                  {data.characters.map((c, i) => (
+                    <text key={c.id} x={10} y={30 + i * LANE_H} fontSize="11" fill={c.color} fontFamily="monospace">{c.name}</text>
+                  ))}
+                </svg>
+              </div>
+              <p className="text-xs text-[#8f8a7f] font-mono mt-1">amber line = current scrubber day · bubbles = characters sharing a location on overlapping days</p>
+            </div>
+          </div>
+
+          {/* Sidebar */}
+          <div className="space-y-6 text-sm">
+            <div>
+              <h2 className="text-base mb-2">Characters</h2>
+              <div className="space-y-1 mb-2">
+                {data.characters.map((c) => (
+                  <div key={c.id} onClick={() => setSelectedChar(c.id)} className="flex items-center justify-between border rounded px-2 py-1.5 cursor-pointer"
+                    style={{ borderColor: selectedChar === c.id ? c.color : "#3a3a44" }}>
+                    <span className="flex items-center gap-2"><span className="w-2.5 h-2.5 rounded-full inline-block" style={{ background: c.color }} />{c.name}</span>
+                    <button onClick={(e) => { e.stopPropagation(); removeCharacter(c.id); }} className="text-[#8f8a7f] hover:text-[#e0555f]">✕</button>
+                  </div>
+                ))}
+              </div>
+              <AddCharForm onAdd={addCharacter} />
+            </div>
+
+            {selectedChar && (
+              <PointsEditor
+                charId={selectedChar}
+                points={pointsForChar(data, selectedChar)}
+                locations={data.locations}
+                onAdd={addPointForm}
+                onUpdate={updatePoint}
+                onRemove={removePoint}
+                onEdit={setEditingPointId}
+              />
+            )}
+
+            <div>
+              <h2 className="text-base mb-2">Locations ({data.locations.length})</h2>
+              <div className="text-xs text-[#8f8a7f] max-h-32 overflow-y-auto space-y-0.5">
+                {data.locations.map((l) => <div key={l.id}>{l.name}</div>)}
+              </div>
+            </div>
+            <div>
+              <h2 className="text-base mb-2">Routes ({data.routes.length})</h2>
+              <div className="text-xs text-[#8f8a7f] max-h-32 overflow-y-auto space-y-0.5">
+                {data.routes.map((r) => <div key={r.id}>{r.name}{r.miles ? ` — ${r.miles.toFixed(0)}mi` : ""}</div>)}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AddCharForm({ onAdd }) {
+  const [name, setName] = useState("");
+  return (
+    <div className="flex gap-2">
+      <input value={name} onChange={(e) => setName(e.target.value)} placeholder="New character"
+        className="flex-1 bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1.5 text-xs"
+        onKeyDown={(e) => { if (e.key === "Enter" && name.trim()) { onAdd(name); setName(""); } }} />
+      <button onClick={() => { if (name.trim()) { onAdd(name); setName(""); } }} className="px-2 py-1.5 text-xs border border-[#3a3a44] rounded hover:border-[#8f8a7f]">+ Add</button>
+    </div>
+  );
+}
+
+function PointsEditor({ charId, points, locations, onAdd, onUpdate, onRemove, onEdit }) {
+  const [locId, setLocId] = useState("");
+  const [startDay, setStartDay] = useState(1);
+  const [endDay, setEndDay] = useState(1);
+  const [note, setNote] = useState("");
+  const locName = (id) => locations.find((l) => l.id === id)?.name || "?";
+
+  return (
+    <div>
+      <h2 className="text-base mb-2">Points</h2>
+      <div className="space-y-2 mb-3">
+        {points.map((p) => (
+          <div key={p.id} className="border border-[#3a3a44] rounded px-2 py-2 text-xs">
+            <div className="flex items-center justify-between mb-1">
+              <span onClick={() => onEdit(p.id)} className="cursor-pointer hover:underline">{locName(p.locationId)} · day {p.startDay}{p.endDay !== p.startDay ? `–${p.endDay}` : ""}</span>
+              <button onClick={() => onRemove(p.id)} className="text-[#8f8a7f] hover:text-[#e0555f]">✕</button>
+            </div>
+            {p.note && <div className="text-[#8f8a7f] italic">{p.note}</div>}
+          </div>
+        ))}
+        {points.length === 0 && <div className="text-xs text-[#8f8a7f] italic">No points yet — click the map in "Add point" mode, or add one below.</div>}
+      </div>
+
+      <div className="space-y-2 text-xs border-t border-[#3a3a44] pt-2">
+        <div className="text-[#8f8a7f]">Add point without clicking the map:</div>
+        <select value={locId} onChange={(e) => setLocId(e.target.value)} className="w-full bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1.5">
+          <option value="">Location…</option>
+          {locations.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
+        </select>
+        <div className="flex items-center gap-2">
+          <span className="text-[#8f8a7f]">days</span>
+          <input type="number" value={startDay} onChange={(e) => setStartDay(parseInt(e.target.value) || 1)} className="w-16 bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1" />
+          <span>–</span>
+          <input type="number" value={endDay} onChange={(e) => setEndDay(parseInt(e.target.value) || 1)} className="w-16 bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1" />
+        </div>
+        <textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="What's happening…" className="w-full bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1.5 h-14" />
+        <button disabled={!locId} onClick={() => { onAdd(charId, locId, startDay, endDay, note); setLocId(""); setNote(""); }}
+          className="px-2 py-1 border border-[#3a3a44] rounded hover:border-[#8f8a7f] disabled:opacity-30">Add point</button>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
