@@ -19,8 +19,8 @@ const { useState, useEffect, useMemo, useRef } = React;
 // ---------------------------------------------------------------
 // SUPABASE CONFIG
 // ---------------------------------------------------------------
-const SUPABASE_URL = "https://qusqdgagnmsghysuidau.supabase.co";
-const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InF1c3FkZ2Fnbm1zZ2h5c3VpZGF1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM5ODYxMjgsImV4cCI6MjA5OTU2MjEyOH0.i8PfGYpjnzQlmrtSuf22snJIu2GD0p_NX2ztu5zlCrY";
+const SUPABASE_URL = "YOUR_SUPABASE_URL";
+const SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_KEY";
 const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const TABLE = "story_world";
 
@@ -137,7 +137,33 @@ function App() {
   const [day, setDay] = useState(1);
   const [playing, setPlaying] = useState(false);
 
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const dragRef = useRef({ active: false, startX: 0, startY: 0, startPan: { x: 0, y: 0 }, moved: false });
+
   const imgRef = useRef(null);
+  const viewportRef = useRef(null);
+
+  function clampZoom(z) { return Math.min(5, Math.max(1, z)); }
+
+  function onWheelZoom(e) {
+    e.preventDefault();
+    setZoom((z) => clampZoom(z - e.deltaY * 0.0015));
+  }
+  function onMapMouseDown(e) {
+    dragRef.current = { active: true, startX: e.clientX, startY: e.clientY, startPan: { ...pan }, moved: false };
+  }
+  function onMapMouseMove(e) {
+    if (!dragRef.current.active) return;
+    const dx = e.clientX - dragRef.current.startX;
+    const dy = e.clientY - dragRef.current.startY;
+    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) dragRef.current.moved = true;
+    if (dragRef.current.moved) {
+      setPan({ x: dragRef.current.startPan.x + dx, y: dragRef.current.startPan.y + dy });
+    }
+  }
+  function onMapMouseUp() { dragRef.current.active = false; }
+  function resetView() { setZoom(1); setPan({ x: 0, y: 0 }); }
 
   useEffect(() => {
     if (SUPABASE_URL.includes("YOUR_SUPABASE") || SUPABASE_ANON_KEY.includes("YOUR_SUPABASE")) setConfigError(true);
@@ -176,6 +202,7 @@ function App() {
   function update(patch) { setData((d) => ({ ...d, ...patch })); }
 
   function handleMapClick(e) {
+    if (dragRef.current.moved) { dragRef.current.moved = false; return; }
     const rect = imgRef.current.getBoundingClientRect();
     const x = ((e.clientX - rect.left) / rect.width) * 100;
     const y = ((e.clientY - rect.top) / rect.height) * 100;
@@ -365,23 +392,41 @@ function App() {
               {mode === "route" && <button onClick={finishRoute} className="px-3 py-1.5 rounded border border-[#4fb8a0] text-[#4fb8a0]">Finish route ({routeDraft.length} pts)</button>}
               {mode === "point" && <span className="px-3 py-1.5 text-[#8f8a7f]">active: {data.characters.find(c=>c.id===selectedChar)?.name || "select a character →"} · day {day}</span>}
               {data.calibration && <span className="px-3 py-1.5 text-[#8f8a7f]">1px ≈ {data.calibration.milesPerPixel.toFixed(3)} mi</span>}
+              <span className="flex items-center gap-1 ml-auto">
+                <button onClick={() => setZoom((z) => clampZoom(z - 0.4))} className="px-2 py-1 border border-[#3a3a44] rounded hover:border-[#8f8a7f]">−</button>
+                <span className="px-1 text-[#8f8a7f]">{Math.round(zoom * 100)}%</span>
+                <button onClick={() => setZoom((z) => clampZoom(z + 0.4))} className="px-2 py-1 border border-[#3a3a44] rounded hover:border-[#8f8a7f]">+</button>
+                <button onClick={resetView} className="px-2 py-1 border border-[#3a3a44] rounded hover:border-[#8f8a7f]">Reset view</button>
+              </span>
             </div>
 
-            <div className="relative border border-[#3a3a44] rounded overflow-hidden bg-[#0f0f13]" style={{ cursor: mode === "view" ? "default" : "crosshair" }}>
-              <img ref={imgRef} src={MAP_IMAGE} alt="map" className="w-full block select-none" draggable={false} onClick={handleMapClick} />
-              <svg className="absolute inset-0 w-full h-full pointer-events-none" viewBox="0 0 100 100" preserveAspectRatio="none">
-                {data.routes.map((r) => (
-                  <polyline key={r.id} points={r.points.map((p) => `${p.x},${p.y}`).join(" ")} fill="none" stroke="#8f8a7f" strokeWidth="0.3" strokeDasharray="1 1" vectorEffect="non-scaling-stroke" />
+            <div
+              ref={viewportRef}
+              className="relative border border-[#3a3a44] rounded bg-[#0f0f13]"
+              style={{ overflow: "hidden", aspectRatio: `${MAP_NATURAL_W} / ${MAP_NATURAL_H}`, maxHeight: "75vh", cursor: mode === "view" ? (dragRef.current.active ? "grabbing" : "grab") : "crosshair" }}
+              onWheel={onWheelZoom}
+              onMouseDown={onMapMouseDown}
+              onMouseMove={onMapMouseMove}
+              onMouseUp={onMapMouseUp}
+              onMouseLeave={onMapMouseUp}
+            >
+              <div style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, transformOrigin: "0 0", width: "100%", position: "relative" }}>
+                <img ref={imgRef} src={MAP_IMAGE} alt="map" className="w-full block select-none" draggable={false} onClick={handleMapClick} />
+                <svg className="absolute inset-0 w-full h-full pointer-events-none" viewBox="0 0 100 100" preserveAspectRatio="none">
+                  {data.routes.map((r) => (
+                    <polyline key={r.id} points={r.points.map((p) => `${p.x},${p.y}`).join(" ")} fill="none" stroke="#8f8a7f" strokeWidth="0.3" strokeDasharray="1 1" vectorEffect="non-scaling-stroke" />
+                  ))}
+                  {routeDraft.length > 0 && <polyline points={routeDraft.map((p) => `${p.x},${p.y}`).join(" ")} fill="none" stroke="#4fb8a0" strokeWidth="0.4" vectorEffect="non-scaling-stroke" />}
+                  {data.locations.map((l) => <circle key={l.id} cx={l.x} cy={l.y} r="0.6" fill="#ece7dd" stroke="#15151a" strokeWidth="0.15" />)}
+                  {currentPositions.map(({ c, pos }) => pos && <circle key={c.id} cx={pos.x} cy={pos.y} r="1" fill={c.color} stroke="#15151a" strokeWidth="0.2" />)}
+                </svg>
+                {data.locations.map((l) => (
+                  <div key={l.id} className="absolute text-[10px] font-mono text-[#ece7dd] bg-[#15151a]/70 px-1 rounded pointer-events-none"
+                    style={{ left: `${l.x}%`, top: `${l.y}%`, transform: "translate(6px, -50%)" }}>{l.name}</div>
                 ))}
-                {routeDraft.length > 0 && <polyline points={routeDraft.map((p) => `${p.x},${p.y}`).join(" ")} fill="none" stroke="#4fb8a0" strokeWidth="0.4" vectorEffect="non-scaling-stroke" />}
-                {data.locations.map((l) => <circle key={l.id} cx={l.x} cy={l.y} r="0.6" fill="#ece7dd" stroke="#15151a" strokeWidth="0.15" />)}
-                {currentPositions.map(({ c, pos }) => pos && <circle key={c.id} cx={pos.x} cy={pos.y} r="1" fill={c.color} stroke="#15151a" strokeWidth="0.2" />)}
-              </svg>
-              {data.locations.map((l) => (
-                <div key={l.id} className="absolute text-[10px] font-mono text-[#ece7dd] bg-[#15151a]/70 px-1 rounded pointer-events-none"
-                  style={{ left: `${l.x}%`, top: `${l.y}%`, transform: "translate(6px, -50%)" }}>{l.name}</div>
-              ))}
+              </div>
             </div>
+            <p className="text-xs text-[#8f8a7f] font-mono mt-1">scroll/pinch to zoom · click-drag to pan (in View mode)</p>
 
             {editingPoint && (
               <div className="mt-3 border border-[#4fb8a0] rounded p-3 text-xs space-y-2">
