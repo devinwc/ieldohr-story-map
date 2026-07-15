@@ -210,14 +210,15 @@ function shortestPathTyped(data, fromId, toId, segType) {
 
 // ---- fastest route, mixing modes across land/sea segments as needed ------
 // each segment is assigned to whichever registered mode of its type is
-// fastest (e.g. horseback beats walking on land); air segments/modes are
-// excluded since airship is a deliberate override, not part of a mixed trip.
+// fastest (e.g. horseback beats walking on land). Established air segments
+// are included too — this is how a trip can hop from horseback/ship onto
+// an airship at a city with a known air route — but there's no straight-
+// line flight fallback here; only routes you've actually drawn count.
 function fastestMixedPath(data, fromId, toId) {
   if (fromId === toId) return { legs: [], hops: [], totalDays: 0 };
   const adj = {};
   (data.segments || []).forEach((seg) => {
     const type = seg.type || "land";
-    if (type === "air") return;
     const modesOfType = data.travelModes.filter((m) => m.segType === type);
     if (modesOfType.length === 0) return;
     const bestMode = modesOfType.reduce((a, b) => (b.speed > a.speed ? b : a));
@@ -272,7 +273,7 @@ function calculateTravel(data, fromId, toId, modeId) {
 
   if (modeId === "fastest") {
     const result = fastestMixedPath(data, fromId, toId);
-    if (!result) return { note: "no connected land/sea route between these two locations" };
+    if (!result) return { note: "no connected route (land, sea, or established air) between these two locations" };
     return {
       days: result.totalDays,
       legs: result.legs.map((l) => ({ ...l, fromName: nodeById(data, l.from)?.name || "junction", toName: nodeById(data, l.to)?.name || "junction" })),
