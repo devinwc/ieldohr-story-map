@@ -144,35 +144,40 @@ function shortestPath(data, fromId, toId) {
   }
   return hops;
 }
-function concatenatedPathPoints(data, fromId, toId) {
-  const hops = shortestPath(data, fromId, toId);
+function pointsFromHops(data, hops) {
   if (!hops || hops.length === 0) return null;
   let pts = [];
   hops.forEach((hop, idx) => {
     const seg = data.segments.find((s) => s.id === hop.segmentId);
+    if (!seg) return;
     let segPts = seg.points;
     if (hop.reversed) segPts = [...segPts].reverse();
     pts = idx === 0 ? pts.concat(segPts) : pts.concat(segPts.slice(1));
   });
   return pts;
 }
+function concatenatedPathPoints(data, fromId, toId) {
+  const hops = shortestPath(data, fromId, toId);
+  return pointsFromHops(data, hops);
+}
 
 // ---- mode-restricted, terrain-weighted travel calculation ----------------
 // only considers segments matching segType (land/sea/air); "effective" miles
 // factor in each segment's difficulty multiplier, "raw" miles do not.
 function shortestPathTyped(data, fromId, toId, segType) {
-  if (fromId === toId) return { effectiveMiles: 0, rawMiles: 0 };
+  if (fromId === toId) return { effectiveMiles: 0, rawMiles: 0, hops: [] };
   const adj = {};
   (data.segments || []).forEach((seg) => {
     if ((seg.type || "land") !== segType) return;
     const mult = seg.multiplier || 1;
     const rawMiles = seg.miles != null ? seg.miles : routeLengthPx(seg.points) * (data.calibration ? data.calibration.milesPerPixel : 0.05);
     const w = rawMiles * mult;
-    (adj[seg.fromNodeId] = adj[seg.fromNodeId] || []).push({ to: seg.toNodeId, w, raw: rawMiles });
-    (adj[seg.toNodeId] = adj[seg.toNodeId] || []).push({ to: seg.fromNodeId, w, raw: rawMiles });
+    (adj[seg.fromNodeId] = adj[seg.fromNodeId] || []).push({ to: seg.toNodeId, w, raw: rawMiles, segmentId: seg.id, reversed: false });
+    (adj[seg.toNodeId] = adj[seg.toNodeId] || []).push({ to: seg.fromNodeId, w, raw: rawMiles, segmentId: seg.id, reversed: true });
   });
   const distMap = { [fromId]: 0 };
   const rawMap = { [fromId]: 0 };
+  const prev = {};
   const visited = new Set();
   const queue = [[0, fromId]];
   while (queue.length) {
@@ -186,34 +191,113 @@ function shortestPathTyped(data, fromId, toId, segType) {
       if (distMap[edge.to] === undefined || nd < distMap[edge.to]) {
         distMap[edge.to] = nd;
         rawMap[edge.to] = (rawMap[u] || 0) + edge.raw;
+        prev[edge.to] = { from: u, segmentId: edge.segmentId, reversed: edge.reversed };
         queue.push([nd, edge.to]);
       }
     });
   }
   if (distMap[toId] === undefined) return null;
-  return { effectiveMiles: distMap[toId], rawMiles: rawMap[toId] };
+  const hops = [];
+  let cur = toId;
+  while (cur !== fromId) {
+    const p = prev[cur];
+    if (!p) return null;
+    hops.unshift({ segmentId: p.segmentId, reversed: p.reversed });
+    cur = p.from;
+  }
+  return { effectiveMiles: distMap[toId], rawMiles: rawMap[toId], hops };
+}
+
+// ---- fastest route, mixing modes across land/sea segments as needed ------
+// each segment is assigned to whichever registered mode of its type is
+// fastest (e.g. horseback beats walking on land); air segments/modes are
+// excluded since airship is a deliberate override, not part of a mixed trip.
+function fastestMixedPath(data, fromId, toId) {
+  if (fromId === toId) return { legs: [], hops: [], totalDays: 0 };
+  const adj = {};
+  (data.segments || []).forEach((seg) => {
+    const type = seg.type || "land";
+    if (type === "air") return;
+    const modesOfType = data.travelModes.filter((m) => m.segType === type);
+    if (modesOfType.length === 0) return;
+    const bestMode = modesOfType.reduce((a, b) => (b.speed > a.speed ? b : a));
+    const mult = seg.multiplier || 1;
+    const rawMiles = seg.miles != null ? seg.miles : routeLengthPx(seg.points) * (data.calibration ? data.calibration.milesPerPixel : 0.05);
+    const time = (rawMiles * mult) / bestMode.speed;
+    const base = { w: time, raw: rawMiles, modeId: bestMode.id, modeName: bestMode.name, segmentId: seg.id };
+    (adj[seg.fromNodeId] = adj[seg.fromNodeId] || []).push({ ...base, to: seg.toNodeId, reversed: false });
+    (adj[seg.toNodeId] = adj[seg.toNodeId] || []).push({ ...base, to: seg.fromNodeId, reversed: true });
+  });
+  const distMap = { [fromId]: 0 };
+  const prev = {};
+  const visited = new Set();
+  const queue = [[0, fromId]];
+  while (queue.length) {
+    queue.sort((a, b) => a[0] - b[0]);
+    const [d, u] = queue.shift();
+    if (visited.has(u)) continue;
+    visited.add(u);
+    if (u === toId) break;
+    (adj[u] || []).forEach((edge) => {
+      const nd = d + edge.w;
+      if (distMap[edge.to] === undefined || nd < distMap[edge.to]) {
+        distMap[edge.to] = nd;
+        prev[edge.to] = { from: u, ...edge };
+        queue.push([nd, edge.to]);
+      }
+    });
+  }
+  if (distMap[toId] === undefined) return null;
+  const legs = [];
+  let cur = toId;
+  while (cur !== fromId) {
+    const p = prev[cur];
+    if (!p) return null;
+    legs.unshift({ modeId: p.modeId, modeName: p.modeName, miles: p.raw, segmentId: p.segmentId, reversed: p.reversed, from: p.from, to: cur });
+    cur = p.from;
+  }
+  const groups = [];
+  legs.forEach((leg) => {
+    const last = groups[groups.length - 1];
+    if (last && last.modeId === leg.modeId) { last.to = leg.to; last.miles += leg.miles; }
+    else groups.push({ modeId: leg.modeId, modeName: leg.modeName, from: leg.from, to: leg.to, miles: leg.miles });
+  });
+  const hops = legs.map((l) => ({ segmentId: l.segmentId, reversed: l.reversed }));
+  return { legs: groups, hops, totalDays: Math.max(1, Math.ceil(distMap[toId])) };
 }
 
 function calculateTravel(data, fromId, toId, modeId) {
-  const mode = data.travelModes.find((m) => m.id === modeId);
-  if (!mode || !fromId || !toId) return null;
+  if (!fromId || !toId) return null;
   if (fromId === toId) return { days: 0, miles: 0, note: "same location" };
+
+  if (modeId === "fastest") {
+    const result = fastestMixedPath(data, fromId, toId);
+    if (!result) return { note: "no connected land/sea route between these two locations" };
+    return {
+      days: result.totalDays,
+      legs: result.legs.map((l) => ({ ...l, fromName: nodeById(data, l.from)?.name || "junction", toName: nodeById(data, l.to)?.name || "junction" })),
+      highlightPoints: pointsFromHops(data, result.hops),
+    };
+  }
+
+  const mode = data.travelModes.find((m) => m.id === modeId);
+  if (!mode) return null;
 
   if (mode.segType === "air") {
     const airPath = shortestPathTyped(data, fromId, toId, "air");
     if (airPath) {
-      return { miles: airPath.rawMiles, days: Math.max(1, Math.ceil(airPath.effectiveMiles / mode.speed)), note: "flying a drawn air route" };
+      return { miles: airPath.rawMiles, days: Math.max(1, Math.ceil(airPath.effectiveMiles / mode.speed)), note: "flying a drawn air route", highlightPoints: pointsFromHops(data, airPath.hops) };
     }
     const a = data.locations.find((l) => l.id === fromId), b = data.locations.find((l) => l.id === toId);
     if (!a || !b) return null;
     if (!data.calibration) return { note: "set the map scale first (Calibrate scale)" };
     const miles = dist(a, b) * data.calibration.milesPerPixel;
-    return { miles, days: Math.max(1, Math.ceil(miles / mode.speed)), note: "straight line — flying over the terrain, no air route drawn" };
+    return { miles, days: Math.max(1, Math.ceil(miles / mode.speed)), note: "straight line — flying over the terrain, no air route drawn", highlightPoints: [a, b] };
   }
 
   const path = shortestPathTyped(data, fromId, toId, mode.segType);
   if (!path) return { note: `no ${mode.segType} route connects these two locations` };
-  return { miles: path.rawMiles, days: Math.max(1, Math.ceil(path.effectiveMiles / mode.speed)) };
+  return { miles: path.rawMiles, days: Math.max(1, Math.ceil(path.effectiveMiles / mode.speed)), highlightPoints: pointsFromHops(data, path.hops) };
 }
 
 // ---- shared timeline logic -------------------------------------------------
@@ -287,6 +371,8 @@ function App() {
   const [day, setDay] = useState(1);
   const [playing, setPlaying] = useState(false);
   const [showLabels, setShowLabels] = useState(true);
+  const [highlightPath, setHighlightPath] = useState(null);
+  const [selectedNodeId, setSelectedNodeId] = useState(null);
 
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
@@ -420,8 +506,8 @@ function App() {
         const milesA = data.calibration ? routeLengthPx(before) * data.calibration.milesPerPixel : null;
         const milesB = data.calibration ? routeLengthPx(after) * data.calibration.milesPerPixel : null;
         segments = segments.filter((s) => s.id !== seg.id).concat([
-          { id: uid(), name: seg.name, fromNodeId: seg.fromNodeId, toNodeId: newJ.id, points: before, miles: milesA },
-          { id: uid(), name: seg.name, fromNodeId: newJ.id, toNodeId: seg.toNodeId, points: after, miles: milesB },
+          { id: uid(), name: seg.name, fromNodeId: seg.fromNodeId, toNodeId: newJ.id, points: before, miles: milesA, type: seg.type, multiplier: seg.multiplier },
+          { id: uid(), name: seg.name, fromNodeId: newJ.id, toNodeId: seg.toNodeId, points: after, miles: milesB, type: seg.type, multiplier: seg.multiplier },
         ]);
         return { nodeId: newJ.id, name: "fork of " + seg.name };
       }
@@ -646,13 +732,30 @@ function App() {
               <div style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, transformOrigin: "0 0", width: "100%", position: "relative" }}>
                 <img ref={imgRef} src={MAP_IMAGE} alt="map" className="w-full block select-none" draggable={false} onClick={handleMapClick} />
                 <svg className="absolute inset-0 w-full h-full pointer-events-none" viewBox="0 0 100 100" preserveAspectRatio="none">
-                  {data.segments.map((r) => (
-                    <polyline key={r.id} points={r.points.map((p) => `${p.x},${p.y}`).join(" ")} fill="none" stroke="#ece7dd" strokeWidth="0.7" strokeDasharray="1.6 0.8" opacity="0.85" vectorEffect="non-scaling-stroke" />
-                  ))}
+                  {data.segments.map((r) => {
+                    const type = r.type || "land";
+                    const color = type === "sea" ? "#7ec8e3" : type === "air" ? "#2b3f8c" : "#ece7dd";
+                    return (
+                      <polyline key={r.id} points={r.points.map((p) => `${p.x},${p.y}`).join(" ")} fill="none" stroke={color} strokeWidth="0.7" strokeDasharray="1.6 0.8" opacity="0.9" vectorEffect="non-scaling-stroke" />
+                    );
+                  })}
                   {routeDraft.length > 0 && <polyline points={routeDraft.map((p) => `${p.x},${p.y}`).join(" ")} fill="none" stroke="#4fb8a0" strokeWidth="0.7" vectorEffect="non-scaling-stroke" />}
                   {(data.junctions || []).map((j) => <circle key={j.id} cx={j.x} cy={j.y} r="0.35" fill="#e8a33d" stroke="#15151a" strokeWidth="0.1" />)}
                   {data.locations.map((l) => <circle key={l.id} cx={l.x} cy={l.y} r="0.6" fill="#ece7dd" stroke="#15151a" strokeWidth="0.15" />)}
                   {currentPositions.map(({ c, pos }) => pos && <circle key={c.id} cx={pos.x} cy={pos.y} r="1" fill={c.color} stroke="#15151a" strokeWidth="0.2" />)}
+                  {highlightPath && highlightPath.length > 1 && (
+                    <polyline points={highlightPath.map((p) => `${p.x},${p.y}`).join(" ")} fill="none" stroke="#f5d547" strokeWidth="1" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
+                  )}
+                  {selectedNodeId && (() => {
+                    const n = nodeById(data, selectedNodeId);
+                    if (!n) return null;
+                    return (
+                      <g>
+                        <circle cx={n.x} cy={n.y} r="1.6" fill="none" stroke="#f5d547" strokeWidth="0.4" vectorEffect="non-scaling-stroke" />
+                        <circle cx={n.x} cy={n.y} r="0.9" fill="none" stroke="#f5d547" strokeWidth="0.3" vectorEffect="non-scaling-stroke" />
+                      </g>
+                    );
+                  })()}
                 </svg>
                 {showLabels && data.locations.map((l) => (
                   <div key={l.id} className="absolute text-[10px] font-mono text-[#ece7dd] bg-[#15151a]/70 px-1 rounded pointer-events-none"
@@ -778,12 +881,26 @@ function App() {
               <div className="text-xs text-[#8f8a7f] max-h-40 overflow-y-auto space-y-0.5">
                 {[...data.locations].sort((a, b) => a.name.localeCompare(b.name)).map((l) => (
                   <div key={l.id} className="flex items-center justify-between pr-1">
-                    <span>{l.name}</span>
+                    <span onClick={() => setSelectedNodeId((cur) => (cur === l.id ? null : l.id))}
+                      className="cursor-pointer hover:text-[#ece7dd]" style={{ color: selectedNodeId === l.id ? "#f5d547" : undefined }}>{l.name}</span>
                     <button onClick={() => removeLocation(l.id)} className="hover:text-[#e0555f]">✕</button>
                   </div>
                 ))}
               </div>
             </div>
+            {(data.junctions || []).length > 0 && (
+              <div>
+                <h2 className="text-base mb-2">Fork points ({data.junctions.length})</h2>
+                <div className="text-xs text-[#8f8a7f] max-h-32 overflow-y-auto space-y-0.5">
+                  {data.junctions.map((j, i) => (
+                    <div key={j.id} onClick={() => setSelectedNodeId((cur) => (cur === j.id ? null : j.id))}
+                      className="cursor-pointer hover:text-[#ece7dd]" style={{ color: selectedNodeId === j.id ? "#f5d547" : undefined }}>
+                      Fork {i + 1}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
             <div>
               <h2 className="text-base mb-2">Paths ({data.segments.length})</h2>
               <div className="text-xs text-[#8f8a7f] max-h-56 overflow-y-auto space-y-1.5">
@@ -841,7 +958,7 @@ function App() {
               </div>
             </div>
 
-            <TravelCalculator data={data} />
+            <TravelCalculator data={data} highlightPath={highlightPath} onHighlight={setHighlightPath} />
           </div>
 
         </div>
@@ -862,12 +979,18 @@ function AddCharForm({ onAdd }) {
   );
 }
 
-function TravelCalculator({ data }) {
+function TravelCalculator({ data, highlightPath, onHighlight }) {
   const [fromId, setFromId] = useState("");
   const [toId, setToId] = useState("");
   const [modeId, setModeId] = useState(data.travelModes[0]?.id || "");
   const [result, setResult] = useState(null);
   const sortedLocations = [...data.locations].sort((a, b) => a.name.localeCompare(b.name));
+
+  function calc() {
+    const r = calculateTravel(data, fromId, toId, modeId);
+    setResult(r);
+    onHighlight(r && r.highlightPoints ? r.highlightPoints : null);
+  }
 
   return (
     <div>
@@ -882,21 +1005,36 @@ function TravelCalculator({ data }) {
           {sortedLocations.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
         </select>
         <select value={modeId} onChange={(e) => setModeId(e.target.value)} className="w-full bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1.5">
+          <option value="fastest">Fastest available (mix modes)</option>
           {data.travelModes.map((m) => <option key={m.id} value={m.id}>{m.name} ({m.speed}mi/day)</option>)}
         </select>
-        <button
-          onClick={() => setResult(calculateTravel(data, fromId, toId, modeId))}
-          disabled={!fromId || !toId}
-          className="px-2 py-1 border border-[#3a3a44] rounded hover:border-[#8f8a7f] disabled:opacity-30"
-        >
-          Calculate
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={calc}
+            disabled={!fromId || !toId}
+            className="px-2 py-1 border border-[#3a3a44] rounded hover:border-[#8f8a7f] disabled:opacity-30"
+          >
+            Calculate
+          </button>
+          {highlightPath && (
+            <button onClick={() => onHighlight(null)} className="px-2 py-1 border border-[#3a3a44] rounded hover:border-[#8f8a7f]">
+              Clear highlight
+            </button>
+          )}
+        </div>
         {result && (
           <div className="border border-[#3a3a44] rounded px-2 py-1.5 text-[#ece7dd]">
             {result.days !== undefined ? (
               <div>
                 {result.miles != null && <div>{result.miles.toFixed(0)} miles</div>}
                 <div>≈ {result.days} day{result.days === 1 ? "" : "s"}</div>
+                {result.legs && result.legs.length > 0 && (
+                  <div className="mt-1 space-y-0.5 text-[#8f8a7f]">
+                    {result.legs.map((l, i) => (
+                      <div key={i}>{l.modeName}: {l.fromName} → {l.toName} ({l.miles.toFixed(0)}mi)</div>
+                    ))}
+                  </div>
+                )}
                 {result.note && <div className="text-[#8f8a7f] italic mt-1">{result.note}</div>}
               </div>
             ) : (
