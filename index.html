@@ -466,13 +466,33 @@ function App() {
       const threshold = 2; // % distance tolerance to snap to existing pin
       let loc = data.locations.find((l) => Math.hypot(l.x - x, l.y - y) < threshold);
       if (!loc) {
-        const name = prompt("New location name (you clicked an unpinned spot):");
+        let segBest = null, segBestD = Infinity;
+        data.segments.forEach((seg) => {
+          const np = nearestPointOnPolyline({ x, y }, seg.points);
+          if (np.d < threshold && np.d < segBestD) { segBestD = np.d; segBest = { seg, np }; }
+        });
+        const name = prompt(segBest ? `New location name (this splices into "${segBest.seg.name}"):` : "New location name (you clicked an unpinned spot):");
         if (!name || !name.trim()) return;
-        loc = { id: uid(), name: name.trim(), x, y };
-        update({ locations: [...data.locations, loc] });
+
+        if (segBest) {
+          const { seg, np } = segBest;
+          loc = { id: uid(), name: name.trim(), x: np.point.x, y: np.point.y };
+          const before = seg.points.slice(0, np.segIndex + 1).concat([np.point]);
+          const after = [np.point].concat(seg.points.slice(np.segIndex + 1));
+          const milesA = data.calibration ? routeLengthPx(before) * data.calibration.milesPerPixel : null;
+          const milesB = data.calibration ? routeLengthPx(after) * data.calibration.milesPerPixel : null;
+          const newSegments = data.segments.filter((s) => s.id !== seg.id).concat([
+            { id: uid(), name: seg.name, fromNodeId: seg.fromNodeId, toNodeId: loc.id, points: before, miles: milesA, type: seg.type, multiplier: seg.multiplier },
+            { id: uid(), name: seg.name, fromNodeId: loc.id, toNodeId: seg.toNodeId, points: after, miles: milesB, type: seg.type, multiplier: seg.multiplier },
+          ]);
+          update({ locations: [...data.locations, loc], segments: newSegments });
+        } else {
+          loc = { id: uid(), name: name.trim(), x, y };
+          update({ locations: [...data.locations, loc] });
+        }
       }
       const newPoint = { id: uid(), characterId: selectedChar, locationId: loc.id, startDay: day, endDay: day, note: "" };
-      setData((d) => ({ ...d, points: [...d.points, newPoint], locations: d.locations.some(l => l.id === loc.id) ? d.locations : [...d.locations, loc] }));
+      setData((d) => ({ ...d, points: [...d.points, newPoint] }));
       setEditingPointId(newPoint.id);
     }
   }
@@ -600,7 +620,8 @@ function App() {
   }
 
   // ---- thread diagram computation ----
-  const LANE_H = 56, DAY_W = 26, LEFT_PAD = 90, TOP_PAD = 30, BOTTOM_PAD = 30;
+  const [dayWidth, setDayWidth] = useState(26);
+  const LANE_H = 56, LEFT_PAD = 90, TOP_PAD = 30, BOTTOM_PAD = 30;
   const threadLayout = useMemo(() => {
     if (data.characters.length === 0 || data.points.length === 0) return { paths: [], bubbles: [], width: 400, height: 200 };
     const homeLane = (charId) => data.characters.findIndex((c) => c.id === charId);
@@ -626,7 +647,7 @@ function App() {
       const verts = cols.map((d) => {
         const info = laneYFor(ch.id, d);
         const y = info ? info.y : TOP_PAD + homeLane(ch.id) * LANE_H;
-        return { x: LEFT_PAD + (d - breaks[0]) * DAY_W, y, day: d };
+        return { x: LEFT_PAD + (d - breaks[0]) * dayWidth, y, day: d };
       });
       return { ch, pts: verts };
     });
@@ -645,15 +666,15 @@ function App() {
           const key = `${d}-${locId}`;
           const colors = chars.map((c) => c.color);
           const locName = data.locations.find((l) => l.id === locId)?.name || "";
-          bubbleMap.set(key, { x: LEFT_PAD + (d - breaks[0]) * DAY_W, y: TOP_PAD + avgLane * LANE_H, colors, locName });
+          bubbleMap.set(key, { x: LEFT_PAD + (d - breaks[0]) * dayWidth, y: TOP_PAD + avgLane * LANE_H, colors, locName });
         }
       });
     });
 
-    const width = LEFT_PAD + (breaks[breaks.length - 1] - breaks[0]) * DAY_W + 60;
+    const width = LEFT_PAD + (breaks[breaks.length - 1] - breaks[0]) * dayWidth + 60;
     const height = TOP_PAD + Math.max(data.characters.length - 1, 0) * LANE_H + BOTTOM_PAD + TOP_PAD;
-    return { paths, bubbles: Array.from(bubbleMap.values()), width, height, dayToX: (d) => LEFT_PAD + (d - breaks[0]) * DAY_W };
-  }, [data]);
+    return { paths, bubbles: Array.from(bubbleMap.values()), width, height, dayToX: (d) => LEFT_PAD + (d - breaks[0]) * dayWidth };
+  }, [data, dayWidth]);
 
   function pathD(pts) {
     if (pts.length === 0) return "";
@@ -811,9 +832,13 @@ function App() {
                     className="w-16 bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1" />
                 </span>
               </div>
-              <div className="flex items-center gap-3 mb-2 font-mono text-xs">
-                <span className="whitespace-nowrap">{formatDay(day)}</span>
-                <input type="range" min="1" max={maxDay} value={day} onChange={(e) => setDay(parseInt(e.target.value))} className="flex-1" />
+              <div className="flex items-center gap-2 mb-2 font-mono text-xs flex-wrap">
+                <button onClick={() => setDay((d) => Math.max(1, d - 10))} className="px-2 py-1 border border-[#3a3a44] rounded hover:border-[#8f8a7f]">« 10</button>
+                <button onClick={() => setDay((d) => Math.max(1, d - 1))} className="px-2 py-1 border border-[#3a3a44] rounded hover:border-[#8f8a7f]">‹ 1</button>
+                <span className="whitespace-nowrap px-1">{formatDay(day)}</span>
+                <input type="range" min="1" max={maxDay} value={day} onChange={(e) => setDay(parseInt(e.target.value))} className="flex-1 min-w-[120px]" />
+                <button onClick={() => setDay((d) => Math.min(maxDay, d + 1))} className="px-2 py-1 border border-[#3a3a44] rounded hover:border-[#8f8a7f]">1 ›</button>
+                <button onClick={() => setDay((d) => Math.min(maxDay, d + 10))} className="px-2 py-1 border border-[#3a3a44] rounded hover:border-[#8f8a7f]">10 »</button>
                 <button onClick={() => setPlaying((p) => !p)} className="px-2 py-1 border border-[#3a3a44] rounded">{playing ? "Pause" : "Play"}</button>
               </div>
               <div className="flex flex-wrap gap-3 text-xs">
@@ -829,7 +854,14 @@ function App() {
 
             {/* Thread diagram */}
             <div className="mt-6">
-              <h2 className="text-base mb-2">Character threads</h2>
+              <div className="flex items-center justify-between mb-2">
+                <h2 className="text-base">Character threads</h2>
+                <span className="flex items-center gap-1 font-mono text-xs text-[#8f8a7f]">
+                  <button onClick={() => setDayWidth((w) => Math.max(4, w - 6))} className="px-2 py-1 border border-[#3a3a44] rounded hover:border-[#8f8a7f]">−</button>
+                  <span>scale</span>
+                  <button onClick={() => setDayWidth((w) => Math.min(120, w + 6))} className="px-2 py-1 border border-[#3a3a44] rounded hover:border-[#8f8a7f]">+</button>
+                </span>
+              </div>
               <div className="border border-[#3a3a44] rounded bg-[#191920] overflow-x-auto">
                 <svg width={Math.max(threadLayout.width, 400)} height={threadLayout.height} className="block">
                   {threadLayout.dayToX && (
@@ -1058,6 +1090,7 @@ function PointsEditor({ charId, points, locations, onAdd, onUpdate, onRemove, on
   const [endDay, setEndDay] = useState(1);
   const [note, setNote] = useState("");
   const locName = (id) => locations.find((l) => l.id === id)?.name || "?";
+  const sortedLocations = [...locations].sort((a, b) => a.name.localeCompare(b.name));
 
   return (
     <div>
@@ -1082,7 +1115,7 @@ function PointsEditor({ charId, points, locations, onAdd, onUpdate, onRemove, on
         <div className="text-[#8f8a7f]">Add point without clicking the map:</div>
         <select value={locId} onChange={(e) => setLocId(e.target.value)} className="w-full bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1.5">
           <option value="">Location…</option>
-          {locations.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
+          {sortedLocations.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
         </select>
         <div className="flex items-center gap-2">
           <span className="text-[#8f8a7f]">days</span>
