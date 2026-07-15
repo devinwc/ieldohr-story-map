@@ -19,8 +19,8 @@ const { useState, useEffect, useMemo, useRef } = React;
 // ---------------------------------------------------------------
 // SUPABASE CONFIG
 // ---------------------------------------------------------------
-const SUPABASE_URL = "https://qusqdgagnmsghysuidau.supabase.co";
-const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InF1c3FkZ2Fnbm1zZ2h5c3VpZGF1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM5ODYxMjgsImV4cCI6MjA5OTU2MjEyOH0.i8PfGYpjnzQlmrtSuf22snJIu2GD0p_NX2ztu5zlCrY";
+const SUPABASE_URL = "YOUR_SUPABASE_URL";
+const SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_KEY";
 const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const TABLE = "story_world";
 
@@ -40,6 +40,12 @@ const emptyData = {
   points: [],      // {id, characterId, locationId, startDay, endDay, note}
   timelineDays: 180,
   timelineUnit: "days", // days | weeks | months
+  travelModes: [
+    { id: "walking", name: "Walking", speed: 20, segType: "land" },
+    { id: "horseback", name: "Horseback", speed: 40, segType: "land" },
+    { id: "ship", name: "Ship", speed: 35, segType: "sea" },
+    { id: "airship", name: "Airship", speed: 150, segType: "air" },
+  ],
 };
 
 function migrateData(raw) {
@@ -149,6 +155,65 @@ function concatenatedPathPoints(data, fromId, toId) {
     pts = idx === 0 ? pts.concat(segPts) : pts.concat(segPts.slice(1));
   });
   return pts;
+}
+
+// ---- mode-restricted, terrain-weighted travel calculation ----------------
+// only considers segments matching segType (land/sea/air); "effective" miles
+// factor in each segment's difficulty multiplier, "raw" miles do not.
+function shortestPathTyped(data, fromId, toId, segType) {
+  if (fromId === toId) return { effectiveMiles: 0, rawMiles: 0 };
+  const adj = {};
+  (data.segments || []).forEach((seg) => {
+    if ((seg.type || "land") !== segType) return;
+    const mult = seg.multiplier || 1;
+    const rawMiles = seg.miles != null ? seg.miles : routeLengthPx(seg.points) * (data.calibration ? data.calibration.milesPerPixel : 0.05);
+    const w = rawMiles * mult;
+    (adj[seg.fromNodeId] = adj[seg.fromNodeId] || []).push({ to: seg.toNodeId, w, raw: rawMiles });
+    (adj[seg.toNodeId] = adj[seg.toNodeId] || []).push({ to: seg.fromNodeId, w, raw: rawMiles });
+  });
+  const distMap = { [fromId]: 0 };
+  const rawMap = { [fromId]: 0 };
+  const visited = new Set();
+  const queue = [[0, fromId]];
+  while (queue.length) {
+    queue.sort((a, b) => a[0] - b[0]);
+    const [d, u] = queue.shift();
+    if (visited.has(u)) continue;
+    visited.add(u);
+    if (u === toId) break;
+    (adj[u] || []).forEach((edge) => {
+      const nd = d + edge.w;
+      if (distMap[edge.to] === undefined || nd < distMap[edge.to]) {
+        distMap[edge.to] = nd;
+        rawMap[edge.to] = (rawMap[u] || 0) + edge.raw;
+        queue.push([nd, edge.to]);
+      }
+    });
+  }
+  if (distMap[toId] === undefined) return null;
+  return { effectiveMiles: distMap[toId], rawMiles: rawMap[toId] };
+}
+
+function calculateTravel(data, fromId, toId, modeId) {
+  const mode = data.travelModes.find((m) => m.id === modeId);
+  if (!mode || !fromId || !toId) return null;
+  if (fromId === toId) return { days: 0, miles: 0, note: "same location" };
+
+  if (mode.segType === "air") {
+    const airPath = shortestPathTyped(data, fromId, toId, "air");
+    if (airPath) {
+      return { miles: airPath.rawMiles, days: Math.max(1, Math.ceil(airPath.effectiveMiles / mode.speed)), note: "flying a drawn air route" };
+    }
+    const a = data.locations.find((l) => l.id === fromId), b = data.locations.find((l) => l.id === toId);
+    if (!a || !b) return null;
+    if (!data.calibration) return { note: "set the map scale first (Calibrate scale)" };
+    const miles = dist(a, b) * data.calibration.milesPerPixel;
+    return { miles, days: Math.max(1, Math.ceil(miles / mode.speed)), note: "straight line — flying over the terrain, no air route drawn" };
+  }
+
+  const path = shortestPathTyped(data, fromId, toId, mode.segType);
+  if (!path) return { note: `no ${mode.segType} route connects these two locations` };
+  return { miles: path.rawMiles, days: Math.max(1, Math.ceil(path.effectiveMiles / mode.speed)) };
 }
 
 // ---- shared timeline logic -------------------------------------------------
@@ -373,11 +438,19 @@ function App() {
 
     const name = prompt(`Path name (connecting ${from.name} — ${to.name}):`, `${from.name} – ${to.name}`);
     if (name === null) { setRouteDraft([]); setMode("view"); return; }
+    let type = (prompt(`Terrain type — type "land", "sea", or "air":`, "land") || "land").trim().toLowerCase();
+    if (!["land", "sea", "air"].includes(type)) type = "land";
+    const multRaw = prompt(`Difficulty multiplier (1 = normal pace, 2 = twice as slow, e.g. rough desert terrain):`, "1");
+    const multiplier = Math.max(0.1, parseFloat(multRaw) || 1);
     const miles = data.calibration ? routeLengthPx(routeDraft) * data.calibration.milesPerPixel : null;
-    segments = [...segments, { id: uid(), name: name || `${from.name} – ${to.name}`, fromNodeId: from.nodeId, toNodeId: to.nodeId, points: routeDraft, miles }];
+    segments = [...segments, { id: uid(), name: name || `${from.name} – ${to.name}`, fromNodeId: from.nodeId, toNodeId: to.nodeId, points: routeDraft, miles, type, multiplier }];
 
     update({ junctions, segments });
     setRouteDraft([]); setMode("view");
+  }
+
+  function updateSegment(id, patch) {
+    update({ segments: data.segments.map((s) => (s.id === id ? { ...s, ...patch } : s)) });
   }
 
   function removeSegment(id) {
@@ -712,22 +785,62 @@ function App() {
             </div>
             <div>
               <h2 className="text-base mb-2">Paths ({data.segments.length})</h2>
-              <div className="text-xs text-[#8f8a7f] max-h-40 overflow-y-auto space-y-0.5">
+              <div className="text-xs text-[#8f8a7f] max-h-56 overflow-y-auto space-y-1.5">
                 {data.segments.map((r) => {
                   const fromN = nodeById(data, r.fromNodeId), toN = nodeById(data, r.toNodeId);
                   const fromName = fromN ? (fromN.name || "junction") : "?";
                   const toName = toN ? (toN.name || "junction") : "?";
                   return (
-                    <div key={r.id} className="flex items-center justify-between pr-1 gap-2">
-                      <span>{r.name}: {fromName} — {toName}{r.miles ? ` (${r.miles.toFixed(0)}mi)` : ""}</span>
-                      <button onClick={() => removeSegment(r.id)} className="hover:text-[#e0555f] shrink-0">✕</button>
+                    <div key={r.id} className="border border-[#3a3a44] rounded px-2 py-1.5">
+                      <div className="flex items-center justify-between gap-2 mb-1">
+                        <span>{r.name}: {fromName} — {toName}{r.miles ? ` (${r.miles.toFixed(0)}mi)` : ""}</span>
+                        <button onClick={() => removeSegment(r.id)} className="hover:text-[#e0555f] shrink-0">✕</button>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <select value={r.type || "land"} onChange={(e) => updateSegment(r.id, { type: e.target.value })}
+                          className="bg-[#1c1c22] border border-[#3a3a44] rounded px-1 py-0.5">
+                          <option value="land">Land</option>
+                          <option value="sea">Sea</option>
+                          <option value="air">Air</option>
+                        </select>
+                        <span>×</span>
+                        <input type="number" step="0.1" min="0.1" value={r.multiplier ?? 1}
+                          onChange={(e) => updateSegment(r.id, { multiplier: Math.max(0.1, parseFloat(e.target.value) || 1) })}
+                          className="w-14 bg-[#1c1c22] border border-[#3a3a44] rounded px-1 py-0.5" />
+                        <span>pace</span>
+                      </div>
                     </div>
                   );
                 })}
               </div>
-              <p className="text-[10px] text-[#8f8a7f] mt-1">amber dots on the map are fork points where paths split</p>
+              <p className="text-[10px] text-[#8f8a7f] mt-1">amber dots are fork points · set a path's type so only matching travel modes use it, and bump its multiplier for rough terrain (2 = twice as slow)</p>
             </div>
+
+            <div>
+              <h2 className="text-base mb-2">Travel modes</h2>
+              <div className="space-y-1">
+                {data.travelModes.map((m) => (
+                  <div key={m.id} className="flex items-center gap-2 text-xs">
+                    <span className="w-20 text-[#8f8a7f]">{m.name}</span>
+                    <input type="number" value={m.speed}
+                      onChange={(e) => update({ travelModes: data.travelModes.map((x) => x.id === m.id ? { ...x, speed: parseFloat(e.target.value) || 0 } : x) })}
+                      className="w-16 bg-[#1c1c22] border border-[#3a3a44] rounded px-1 py-0.5" />
+                    <span className="text-[#8f8a7f]">mi/day, uses</span>
+                    <select value={m.segType} onChange={(e) => update({ travelModes: data.travelModes.map((x) => x.id === m.id ? { ...x, segType: e.target.value } : x) })}
+                      className="bg-[#1c1c22] border border-[#3a3a44] rounded px-1 py-0.5">
+                      <option value="land">land</option>
+                      <option value="sea">sea</option>
+                      <option value="air">air</option>
+                    </select>
+                    <span className="text-[#8f8a7f]">paths</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <TravelCalculator data={data} />
           </div>
+
         </div>
       </div>
     </div>
@@ -742,6 +855,52 @@ function AddCharForm({ onAdd }) {
         className="flex-1 bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1.5 text-xs"
         onKeyDown={(e) => { if (e.key === "Enter" && name.trim()) { onAdd(name); setName(""); } }} />
       <button onClick={() => { if (name.trim()) { onAdd(name); setName(""); } }} className="px-2 py-1.5 text-xs border border-[#3a3a44] rounded hover:border-[#8f8a7f]">+ Add</button>
+    </div>
+  );
+}
+
+function TravelCalculator({ data }) {
+  const [fromId, setFromId] = useState("");
+  const [toId, setToId] = useState("");
+  const [modeId, setModeId] = useState(data.travelModes[0]?.id || "");
+  const [result, setResult] = useState(null);
+
+  return (
+    <div>
+      <h2 className="text-base mb-2">Travel calculator</h2>
+      <div className="space-y-2 text-xs">
+        <select value={fromId} onChange={(e) => setFromId(e.target.value)} className="w-full bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1.5">
+          <option value="">From…</option>
+          {data.locations.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
+        </select>
+        <select value={toId} onChange={(e) => setToId(e.target.value)} className="w-full bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1.5">
+          <option value="">To…</option>
+          {data.locations.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
+        </select>
+        <select value={modeId} onChange={(e) => setModeId(e.target.value)} className="w-full bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1.5">
+          {data.travelModes.map((m) => <option key={m.id} value={m.id}>{m.name} ({m.speed}mi/day)</option>)}
+        </select>
+        <button
+          onClick={() => setResult(calculateTravel(data, fromId, toId, modeId))}
+          disabled={!fromId || !toId}
+          className="px-2 py-1 border border-[#3a3a44] rounded hover:border-[#8f8a7f] disabled:opacity-30"
+        >
+          Calculate
+        </button>
+        {result && (
+          <div className="border border-[#3a3a44] rounded px-2 py-1.5 text-[#ece7dd]">
+            {result.days !== undefined ? (
+              <div>
+                {result.miles != null && <div>{result.miles.toFixed(0)} miles</div>}
+                <div>≈ {result.days} day{result.days === 1 ? "" : "s"}</div>
+                {result.note && <div className="text-[#8f8a7f] italic mt-1">{result.note}</div>}
+              </div>
+            ) : (
+              <div className="text-[#e0555f]">{result.note}</div>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
