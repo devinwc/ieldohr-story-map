@@ -264,7 +264,13 @@ function fastestMixedPath(data, fromId, toId) {
     else groups.push({ modeId: leg.modeId, modeName: leg.modeName, from: leg.from, to: leg.to, miles: leg.miles });
   });
   const hops = legs.map((l) => ({ segmentId: l.segmentId, reversed: l.reversed }));
-  return { legs: groups, hops, totalDays: Math.max(1, Math.ceil(distMap[toId])) };
+  return { legs: groups, hops, totalDays: Math.max(0.25, roundToQuarterDay(distMap[toId])) };
+}
+
+// rounds to the nearest quarter-day (e.g. 1.38 -> 1.5), at most 2 decimal places, no trailing zeros
+function roundToQuarterDay(days) {
+  const rounded = Math.round(days * 4) / 4;
+  return Math.round(rounded * 100) / 100;
 }
 
 function calculateTravel(data, fromId, toId, modeId) {
@@ -287,18 +293,18 @@ function calculateTravel(data, fromId, toId, modeId) {
   if (mode.segType === "air") {
     const airPath = shortestPathTyped(data, fromId, toId, "air");
     if (airPath) {
-      return { miles: airPath.rawMiles, days: Math.max(1, Math.ceil(airPath.effectiveMiles / mode.speed)), note: "flying a drawn air route", highlightPoints: pointsFromHops(data, airPath.hops) };
+      return { miles: airPath.rawMiles, days: Math.max(0.25, roundToQuarterDay(airPath.effectiveMiles / mode.speed)), note: "flying a drawn air route", highlightPoints: pointsFromHops(data, airPath.hops) };
     }
     const a = data.locations.find((l) => l.id === fromId), b = data.locations.find((l) => l.id === toId);
     if (!a || !b) return null;
     if (!data.calibration) return { note: "set the map scale first (Calibrate scale)" };
     const miles = dist(a, b) * data.calibration.milesPerPixel;
-    return { miles, days: Math.max(1, Math.ceil(miles / mode.speed)), note: "straight line — flying over the terrain, no air route drawn", highlightPoints: [a, b] };
+    return { miles, days: Math.max(0.25, roundToQuarterDay(miles / mode.speed)), note: "straight line — flying over the terrain, no air route drawn", highlightPoints: [a, b] };
   }
 
   const path = shortestPathTyped(data, fromId, toId, mode.segType);
   if (!path) return { note: `no ${mode.segType} route connects these two locations` };
-  return { miles: path.rawMiles, days: Math.max(1, Math.ceil(path.effectiveMiles / mode.speed)), highlightPoints: pointsFromHops(data, path.hops) };
+  return { miles: path.rawMiles, days: Math.max(0.25, roundToQuarterDay(path.effectiveMiles / mode.speed)), highlightPoints: pointsFromHops(data, path.hops) };
 }
 
 // ---- shared timeline logic -------------------------------------------------
