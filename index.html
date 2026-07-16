@@ -439,9 +439,14 @@ function App() {
 
   useEffect(() => {
     if (!playing) return;
-    const t = setInterval(() => setDay((d) => d + 1), 500);
+    const t = setInterval(() => {
+      setDay((d) => {
+        if (d >= data.timelineDays) { setPlaying(false); return d; }
+        return d + 1;
+      });
+    }, 500);
     return () => clearInterval(t);
-  }, [playing]);
+  }, [playing, data.timelineDays]);
 
   useEffect(() => {
     const el = threadScrollRef.current;
@@ -639,6 +644,7 @@ function App() {
   // ---- thread diagram computation ----
   const [dayWidth, setDayWidth] = useState(26);
   const threadScrollRef = useRef(null);
+  const [hoveredMarker, setHoveredMarker] = useState(null);
   const [threadScrollLeft, setThreadScrollLeft] = useState(0);
   const [threadScrollMax, setThreadScrollMax] = useState(0);
   const LANE_H = 56, LEFT_PAD = 90, TOP_PAD = 30, BOTTOM_PAD = 30;
@@ -691,9 +697,19 @@ function App() {
       });
     });
 
+    const markers = data.points.map((p) => {
+      const ch = data.characters.find((c) => c.id === p.characterId);
+      if (!ch) return null;
+      const info = laneYFor(p.characterId, p.startDay);
+      const y = info ? info.y : TOP_PAD + homeLane(p.characterId) * LANE_H;
+      const x = LEFT_PAD + (p.startDay - breaks[0]) * dayWidth;
+      const locName = data.locations.find((l) => l.id === p.locationId)?.name || "";
+      return { id: p.id, x, y, color: ch.color, note: p.note, charName: ch.name, locName, startDay: p.startDay, endDay: p.endDay };
+    }).filter(Boolean);
+
     const width = LEFT_PAD + (breaks[breaks.length - 1] - breaks[0]) * dayWidth + 60;
     const height = TOP_PAD + Math.max(data.characters.length - 1, 0) * LANE_H + BOTTOM_PAD + TOP_PAD;
-    return { paths, bubbles: Array.from(bubbleMap.values()), width, height, dayToX: (d) => LEFT_PAD + (d - breaks[0]) * dayWidth };
+    return { paths, bubbles: Array.from(bubbleMap.values()), markers, width, height, dayToX: (d) => LEFT_PAD + (d - breaks[0]) * dayWidth };
   }, [data, dayWidth]);
 
   function pathD(pts) {
@@ -869,7 +885,6 @@ function App() {
                   <div key={c.id} className="flex items-center gap-1.5">
                     <span className="w-2.5 h-2.5 rounded-full inline-block" style={{ background: c.color }} />
                     {c.name}: <span className="text-[#8f8a7f]">{pos ? pos.label : "—"}</span>
-                    {pos?.note && <span className="text-[#8f8a7f] italic">— {pos.note}</span>}
                   </div>
                 ))}
               </div>
@@ -890,22 +905,43 @@ function App() {
                 onScroll={(e) => setThreadScrollLeft(e.currentTarget.scrollLeft)}
                 className="border border-[#3a3a44] rounded bg-[#191920] overflow-x-auto"
               >
-                <svg width={Math.max(threadLayout.width, 400)} height={threadLayout.height} className="block">
-                  {threadLayout.dayToX && (
-                    <line x1={threadLayout.dayToX(day)} y1={0} x2={threadLayout.dayToX(day)} y2={threadLayout.height} stroke="#e8a33d" strokeWidth="1" opacity="0.5" />
+                <div style={{ position: "relative", width: Math.max(threadLayout.width, 400), height: threadLayout.height }}>
+                  <svg width={Math.max(threadLayout.width, 400)} height={threadLayout.height} className="block">
+                    {threadLayout.dayToX && (
+                      <line x1={threadLayout.dayToX(day)} y1={0} x2={threadLayout.dayToX(day)} y2={threadLayout.height} stroke="#e8a33d" strokeWidth="1" opacity="0.5" />
+                    )}
+                    {threadLayout.paths.map(({ ch, pts }) => (
+                      <path key={ch.id} d={pathD(pts)} fill="none" stroke={ch.color} strokeWidth="3" strokeLinecap="round" opacity="0.9" />
+                    ))}
+                    {threadLayout.bubbles.map((b, i) => (
+                      <g key={i}>
+                        <circle cx={b.x} cy={b.y} r={9 + b.colors.length * 1.5} fill={blend(b.colors)} opacity="0.85" />
+                      </g>
+                    ))}
+                    {(threadLayout.markers || []).map((m) => (
+                      <circle
+                        key={m.id} cx={m.x} cy={m.y} r="4.5" fill={m.color} stroke="#15151a" strokeWidth="1.3"
+                        style={{ cursor: "pointer" }}
+                        onMouseEnter={() => setHoveredMarker(m)}
+                        onMouseLeave={() => setHoveredMarker((cur) => (cur && cur.id === m.id ? null : cur))}
+                      />
+                    ))}
+                    {data.characters.map((c, i) => (
+                      <text key={c.id} x={10} y={30 + i * LANE_H} fontSize="11" fill={c.color} fontFamily="monospace">{c.name}</text>
+                    ))}
+                  </svg>
+                  {hoveredMarker && (
+                    <div
+                      style={{ position: "absolute", left: hoveredMarker.x + 10, top: Math.max(0, hoveredMarker.y - 12), pointerEvents: "none" }}
+                      className="z-10 max-w-[220px] bg-[#0f0f13] border border-[#3a3a44] rounded px-2 py-1.5 text-xs text-[#ece7dd] shadow-lg"
+                    >
+                      <div className="font-mono text-[#8f8a7f] mb-0.5">
+                        {hoveredMarker.charName} · day {hoveredMarker.startDay}{hoveredMarker.endDay !== hoveredMarker.startDay ? `–${hoveredMarker.endDay}` : ""} · {hoveredMarker.locName}
+                      </div>
+                      <div>{hoveredMarker.note || <span className="italic text-[#8f8a7f]">no note</span>}</div>
+                    </div>
                   )}
-                  {threadLayout.paths.map(({ ch, pts }) => (
-                    <path key={ch.id} d={pathD(pts)} fill="none" stroke={ch.color} strokeWidth="3" strokeLinecap="round" opacity="0.9" />
-                  ))}
-                  {threadLayout.bubbles.map((b, i) => (
-                    <g key={i}>
-                      <circle cx={b.x} cy={b.y} r={9 + b.colors.length * 1.5} fill={blend(b.colors)} opacity="0.85" />
-                    </g>
-                  ))}
-                  {data.characters.map((c, i) => (
-                    <text key={c.id} x={10} y={30 + i * LANE_H} fontSize="11" fill={c.color} fontFamily="monospace">{c.name}</text>
-                  ))}
-                </svg>
+                </div>
               </div>
               {threadScrollMax > 0 && (
                 <input
