@@ -101,6 +101,15 @@ function nodeById(data, id) {
   if (loc) return loc;
   return (data.junctions || []).find((j) => j.id === id) || null;
 }
+// human-readable label for a node: location name, custom junction name, or "Fork N" fallback
+function nodeLabel(data, id) {
+  const loc = data.locations.find((l) => l.id === id);
+  if (loc) return loc.name;
+  const idx = (data.junctions || []).findIndex((j) => j.id === id);
+  if (idx === -1) return "junction";
+  const j = data.junctions[idx];
+  return j.name && j.name.trim() ? j.name.trim() : `Fork ${idx + 1}`;
+}
 function buildGraph(data) {
   const adj = {};
   (data.segments || []).forEach((seg) => {
@@ -284,7 +293,7 @@ function calculateTravel(data, fromId, toId, modeId) {
     if (!result) return { note: "no connected route (land, sea, or established air) between these two locations" };
     return {
       days: result.totalDays,
-      legs: result.legs.map((l) => ({ ...l, fromName: nodeById(data, l.from)?.name || "junction", toName: nodeById(data, l.to)?.name || "junction" })),
+      legs: result.legs.map((l) => ({ ...l, fromName: nodeLabel(data, l.from), toName: nodeLabel(data, l.to) })),
       highlightPoints: pointsFromHops(data, result.hops),
     };
   }
@@ -461,6 +470,76 @@ function App() {
   function switchMap() { localStorage.removeItem("storyWorldId"); setMapId(null); setLoaded(false); setData(emptyData); }
   function update(patch) { setData((d) => ({ ...d, ...patch })); }
 
+  function exportData() {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `ieldohr-map-${mapId || "export"}-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function exportDayReport() {
+    const sorted = [...data.points].sort((a, b) => {
+      if (a.startDay !== b.startDay) return a.startDay - b.startDay;
+      const an = data.characters.find((c) => c.id === a.characterId)?.name || "";
+      const bn = data.characters.find((c) => c.id === b.characterId)?.name || "";
+      return an.localeCompare(bn);
+    });
+    const lines = [];
+    lines.push("IELDOHR STORY MAP — DAY REPORT");
+    lines.push(`Generated: ${new Date().toLocaleString()}`);
+    lines.push("");
+    if (sorted.length === 0) {
+      lines.push("(no points yet)");
+    } else {
+      let lastDay = null;
+      sorted.forEach((p) => {
+        if (p.startDay !== lastDay) {
+          lines.push(`Day ${p.startDay}`);
+          lastDay = p.startDay;
+        }
+        const ch = data.characters.find((c) => c.id === p.characterId);
+        const loc = data.locations.find((l) => l.id === p.locationId);
+        const span = p.endDay !== p.startDay ? ` (through day ${p.endDay})` : "";
+        const noteText = p.note ? `: ${p.note}` : "";
+        lines.push(`  ${ch?.name || "?"} — ${loc?.name || "?"}${span}${noteText}`);
+      });
+    }
+    const blob = new Blob([lines.join("\n")], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `ieldohr-day-report-${mapId || "map"}-${new Date().toISOString().slice(0, 10)}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  const importInputRef = useRef(null);
+  function triggerImport() { importInputRef.current?.click(); }
+  function handleImportFile(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      let parsed;
+      try {
+        parsed = JSON.parse(reader.result);
+      } catch (err) {
+        alert("Couldn't read that file — it doesn't look like valid JSON.");
+        e.target.value = "";
+        return;
+      }
+      const ok = window.confirm(
+        "Import this file and replace everything in the current map (locations, paths, characters, points)?\n\nThis can't be undone — export your current data first if you want a copy of it."
+      );
+      if (ok) setData(migrateData(parsed));
+      e.target.value = "";
+    };
+    reader.readAsText(file);
+  }
+
   function handleMapClick(e) {
     if (dragRef.current.moved) { dragRef.current.moved = false; return; }
     const rect = imgRef.current.getBoundingClientRect();
@@ -610,24 +689,49 @@ function App() {
     });
   }
 
+  function updateJunctionName(id, name) {
+    update({ junctions: (data.junctions || []).map((j) => (j.id === id ? { ...j, name } : j)) });
+  }
+
   function addCharacter(name) {
     if (!name.trim()) return;
     const color = PALETTE[data.characters.length % PALETTE.length];
     update({ characters: [...data.characters, { id: uid(), name: name.trim(), color }] });
   }
   function removeCharacter(id) {
+    const ch = data.characters.find((c) => c.id === id);
+    const pointCount = data.points.filter((p) => p.characterId === id).length;
+    const warning = pointCount ? ` This will also remove their ${pointCount} point(s) from the timeline.` : "";
+    if (!confirm(`Delete "${ch?.name}"?${warning}`)) return;
     update({ characters: data.characters.filter((c) => c.id !== id), points: data.points.filter((p) => p.characterId !== id) });
     if (selectedChar === id) setSelectedChar(null);
   }
 
+  function overlappingPointsFor(charId, startDay, endDay, excludeId) {
+    return data.points.filter((p) => {
+      if (p.characterId !== charId) return false;
+      if (excludeId && p.id === excludeId) return false;
+      return startDay <= p.endDay && p.startDay <= endDay;
+    });
+  }
+
   function addPointForm(charId, locationId, startDay, endDay, note) {
+    const overlaps = overlappingPointsFor(charId, startDay, endDay, null);
+    if (overlaps.length > 0) {
+      const list = overlaps.map((p) => `day ${p.startDay}${p.endDay !== p.startDay ? `–${p.endDay}` : ""} at ${data.locations.find(l => l.id === p.locationId)?.name || "?"}`).join(", ");
+      if (!confirm(`This overlaps this character's existing point(s): ${list}.\n\nOverlapping day ranges can make the thread diagram behave oddly. Add it anyway?`)) return;
+    }
     update({ points: [...data.points, { id: uid(), characterId: charId, locationId, startDay, endDay, note }] });
   }
   function updatePoint(pointId, patch) {
     update({ points: data.points.map((p) => (p.id === pointId ? { ...p, ...patch } : p)) });
   }
   function removePoint(pointId) {
-    update({ points: data.points.filter((p) => p.id !== pointId) });
+    const p = data.points.find((pt) => pt.id === pointId);
+    const loc = p ? data.locations.find((l) => l.id === p.locationId) : null;
+    const label = p ? `the point at "${loc?.name || "?"}" (day ${p.startDay}${p.endDay !== p.startDay ? `–${p.endDay}` : ""})` : "this point";
+    if (!confirm(`Delete ${label}?`)) return;
+    update({ points: data.points.filter((pt) => pt.id !== pointId) });
     if (editingPointId === pointId) setEditingPointId(null);
   }
 
@@ -697,15 +801,24 @@ function App() {
       });
     });
 
-    const markers = data.points.map((p) => {
+    // group point markers that land on the same spot (same day + same merged lane)
+    // so overlapping points don't silently hide each other behind a single circle
+    const markerGroups = new Map();
+    data.points.forEach((p) => {
       const ch = data.characters.find((c) => c.id === p.characterId);
-      if (!ch) return null;
+      if (!ch) return;
       const info = laneYFor(p.characterId, p.startDay);
       const y = info ? info.y : TOP_PAD + homeLane(p.characterId) * LANE_H;
       const x = LEFT_PAD + (p.startDay - breaks[0]) * dayWidth;
       const locName = data.locations.find((l) => l.id === p.locationId)?.name || "";
-      return { id: p.id, x, y, color: ch.color, note: p.note, charName: ch.name, locName, startDay: p.startDay, endDay: p.endDay };
-    }).filter(Boolean);
+      const entry = { pointId: p.id, color: ch.color, note: p.note, charName: ch.name, locName, startDay: p.startDay, endDay: p.endDay };
+      const key = `${Math.round(x)}_${Math.round(y)}`;
+      if (!markerGroups.has(key)) markerGroups.set(key, { x, y, members: [] });
+      markerGroups.get(key).members.push(entry);
+    });
+    const markers = Array.from(markerGroups.values()).map((g, i) => ({
+      id: `mk-${i}`, x: g.x, y: g.y, members: g.members,
+    }));
 
     const width = LEFT_PAD + (breaks[breaks.length - 1] - breaks[0]) * dayWidth + 60;
     const height = TOP_PAD + Math.max(data.characters.length - 1, 0) * LANE_H + BOTTOM_PAD + TOP_PAD;
@@ -752,7 +865,13 @@ function App() {
             <h1 className="text-3xl tracking-tight" style={{ fontFamily: "Georgia, serif" }}>Ieldohr Story Map</h1>
             <p className="text-sm text-[#8f8a7f] mt-1 font-mono">map: {mapId} · {status === "saving" ? "saving…" : status === "saved" ? "synced" : status === "error" ? "save failed" : ""}</p>
           </div>
-          <button onClick={switchMap} className="px-3 py-1.5 text-xs font-mono border border-[#3a3a44] rounded hover:border-[#8f8a7f] transition">Switch map</button>
+          <div className="flex items-center gap-2">
+            <button onClick={exportData} className="px-3 py-1.5 text-xs font-mono border border-[#3a3a44] rounded hover:border-[#8f8a7f] transition">Export JSON</button>
+            <button onClick={triggerImport} className="px-3 py-1.5 text-xs font-mono border border-[#3a3a44] rounded hover:border-[#8f8a7f] transition">Import JSON</button>
+            <input ref={importInputRef} type="file" accept="application/json,.json" onChange={handleImportFile} className="hidden" />
+            <button onClick={exportDayReport} className="px-3 py-1.5 text-xs font-mono border border-[#3a3a44] rounded hover:border-[#8f8a7f] transition">Day report (.txt)</button>
+            <button onClick={switchMap} className="px-3 py-1.5 text-xs font-mono border border-[#3a3a44] rounded hover:border-[#8f8a7f] transition">Switch map</button>
+          </div>
         </div>
 
         <div className="grid lg:grid-cols-[1fr_360px] gap-6">
@@ -826,6 +945,10 @@ function App() {
                   <div key={l.id} className="absolute text-[10px] font-mono text-[#ece7dd] bg-[#15151a]/70 px-1 rounded pointer-events-none"
                     style={{ left: `${l.x}%`, top: `${l.y}%`, transform: "translate(6px, -50%)" }}>{l.name}</div>
                 ))}
+                {showLabels && (data.junctions || []).filter((j) => j.name && j.name.trim()).map((j) => (
+                  <div key={j.id} className="absolute text-[10px] font-mono text-[#e8a33d] bg-[#15151a]/70 px-1 rounded pointer-events-none"
+                    style={{ left: `${j.x}%`, top: `${j.y}%`, transform: "translate(6px, -50%)" }}>{j.name}</div>
+                ))}
               </div>
             </div>
             <p className="text-xs text-[#8f8a7f] font-mono mt-1">scroll/pinch to zoom · click-drag to pan (in View mode)</p>
@@ -842,6 +965,12 @@ function App() {
                   <span>–</span>
                   <input type="number" value={editingPoint.endDay} onChange={(e) => updatePoint(editingPoint.id, { endDay: parseInt(e.target.value) || 1 })} className="w-16 bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1" />
                 </div>
+                {(() => {
+                  const overlaps = overlappingPointsFor(editingPoint.characterId, editingPoint.startDay, editingPoint.endDay, editingPoint.id);
+                  if (overlaps.length === 0) return null;
+                  const list = overlaps.map((p) => `day ${p.startDay}${p.endDay !== p.startDay ? `–${p.endDay}` : ""} at ${data.locations.find(l => l.id === p.locationId)?.name || "?"}`).join(", ");
+                  return <p className="text-[#e8a33d]">⚠ overlaps this character's other point(s): {list}</p>;
+                })()}
                 <textarea value={editingPoint.note} onChange={(e) => updatePoint(editingPoint.id, { note: e.target.value })} placeholder="What's happening here…" className="w-full bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1.5 h-16" />
               </div>
             )}
@@ -918,14 +1047,26 @@ function App() {
                         <circle cx={b.x} cy={b.y} r={9 + b.colors.length * 1.5} fill={blend(b.colors)} opacity="0.85" />
                       </g>
                     ))}
-                    {(threadLayout.markers || []).map((m) => (
-                      <circle
-                        key={m.id} cx={m.x} cy={m.y} r="4.5" fill={m.color} stroke="#15151a" strokeWidth="1.3"
-                        style={{ cursor: "pointer" }}
-                        onMouseEnter={() => setHoveredMarker(m)}
-                        onMouseLeave={() => setHoveredMarker((cur) => (cur && cur.id === m.id ? null : cur))}
-                      />
-                    ))}
+                    {(threadLayout.markers || []).map((m) => {
+                      const multi = m.members.length > 1;
+                      return (
+                        <g key={m.id}>
+                          <circle
+                            cx={m.x} cy={m.y} r={multi ? 7 : 4.5}
+                            fill={multi ? blend(m.members.map((mm) => mm.color)) : m.members[0].color}
+                            stroke="#15151a" strokeWidth={multi ? 1.8 : 1.3}
+                            style={{ cursor: "pointer" }}
+                            onMouseEnter={() => setHoveredMarker(m)}
+                            onMouseLeave={() => setHoveredMarker((cur) => (cur && cur.id === m.id ? null : cur))}
+                          />
+                          {multi && (
+                            <text x={m.x} y={m.y + 3} textAnchor="middle" fontSize="8" fontWeight="bold" fill="#15151a" style={{ pointerEvents: "none" }}>
+                              {m.members.length}
+                            </text>
+                          )}
+                        </g>
+                      );
+                    })}
                     {data.characters.map((c, i) => (
                       <text key={c.id} x={10} y={30 + i * LANE_H} fontSize="11" fill={c.color} fontFamily="monospace">{c.name}</text>
                     ))}
@@ -933,12 +1074,17 @@ function App() {
                   {hoveredMarker && (
                     <div
                       style={{ position: "absolute", left: hoveredMarker.x + 10, top: Math.max(0, hoveredMarker.y - 12), pointerEvents: "none" }}
-                      className="z-10 max-w-[220px] bg-[#0f0f13] border border-[#3a3a44] rounded px-2 py-1.5 text-xs text-[#ece7dd] shadow-lg"
+                      className="z-10 max-w-[240px] bg-[#0f0f13] border border-[#3a3a44] rounded px-2 py-1.5 text-xs text-[#ece7dd] shadow-lg"
                     >
-                      <div className="font-mono text-[#8f8a7f] mb-0.5">
-                        {hoveredMarker.charName} · day {hoveredMarker.startDay}{hoveredMarker.endDay !== hoveredMarker.startDay ? `–${hoveredMarker.endDay}` : ""} · {hoveredMarker.locName}
-                      </div>
-                      <div>{hoveredMarker.note || <span className="italic text-[#8f8a7f]">no note</span>}</div>
+                      {hoveredMarker.members.map((mm, idx) => (
+                        <div key={mm.pointId} className={idx > 0 ? "mt-1.5 pt-1.5 border-t border-[#3a3a44]" : ""}>
+                          <div className="font-mono text-[#8f8a7f] mb-0.5 flex items-center gap-1.5">
+                            <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: mm.color, flexShrink: 0 }}></span>
+                            {mm.charName} · day {mm.startDay}{mm.endDay !== mm.startDay ? `–${mm.endDay}` : ""} · {mm.locName}
+                          </div>
+                          <div>{mm.note || <span className="italic text-[#8f8a7f]">no note</span>}</div>
+                        </div>
+                      ))}
                     </div>
                   )}
                 </div>
@@ -954,7 +1100,7 @@ function App() {
                   className="w-full mt-1.5"
                 />
               )}
-              <p className="text-xs text-[#8f8a7f] font-mono mt-1">amber line = current scrubber day · bubbles = characters sharing a location on overlapping days</p>
+              <p className="text-xs text-[#8f8a7f] font-mono mt-1">amber line = current scrubber day · bubbles = characters sharing a location on overlapping days · numbered dots = multiple points stacked here, hover for all</p>
             </div>
           </div>
 
@@ -1002,11 +1148,19 @@ function App() {
             {(data.junctions || []).length > 0 && (
               <div>
                 <h2 className="text-base mb-2">Fork points ({data.junctions.length})</h2>
-                <div className="text-xs text-[#8f8a7f] max-h-32 overflow-y-auto space-y-0.5">
+                <div className="text-xs text-[#8f8a7f] max-h-40 overflow-y-auto space-y-1">
                   {data.junctions.map((j, i) => (
-                    <div key={j.id} onClick={() => setSelectedNodeId((cur) => (cur === j.id ? null : j.id))}
-                      className="cursor-pointer hover:text-[#ece7dd]" style={{ color: selectedNodeId === j.id ? "#f5d547" : undefined }}>
-                      Fork {i + 1}
+                    <div key={j.id} className="flex items-center gap-1.5">
+                      <span onClick={() => setSelectedNodeId((cur) => (cur === j.id ? null : j.id))}
+                        className="cursor-pointer shrink-0" style={{ color: selectedNodeId === j.id ? "#f5d547" : undefined }}>
+                        ◆
+                      </span>
+                      <input
+                        value={j.name || ""}
+                        onChange={(e) => updateJunctionName(j.id, e.target.value)}
+                        placeholder={`Fork ${i + 1}`}
+                        className="flex-1 min-w-0 bg-[#1c1c22] border border-[#3a3a44] rounded px-1.5 py-0.5 text-[#8f8a7f] focus:text-[#ece7dd]"
+                      />
                     </div>
                   ))}
                 </div>
@@ -1028,9 +1182,8 @@ function App() {
                 {data.segments
                   .filter((r) => !selectedNodeId || r.fromNodeId === selectedNodeId || r.toNodeId === selectedNodeId)
                   .map((r) => {
-                  const fromN = nodeById(data, r.fromNodeId), toN = nodeById(data, r.toNodeId);
-                  const fromName = fromN ? (fromN.name || "junction") : "?";
-                  const toName = toN ? (toN.name || "junction") : "?";
+                  const fromName = nodeLabel(data, r.fromNodeId);
+                  const toName = nodeLabel(data, r.toNodeId);
                   return (
                     <div key={r.id} className="border border-[#3a3a44] rounded px-2 py-1.5">
                       <div className="flex items-center gap-2 mb-1">
@@ -1176,11 +1329,14 @@ function TravelCalculator({ data, highlightPath, onHighlight }) {
 
 function PointsEditor({ charId, points, locations, onAdd, onUpdate, onRemove, onEdit, onClose }) {
   const [locId, setLocId] = useState("");
+  const [locQuery, setLocQuery] = useState("");
+  const [showLocDropdown, setShowLocDropdown] = useState(false);
   const [startDay, setStartDay] = useState(1);
   const [endDay, setEndDay] = useState(1);
   const [note, setNote] = useState("");
   const locName = (id) => locations.find((l) => l.id === id)?.name || "?";
   const sortedLocations = [...locations].sort((a, b) => a.name.localeCompare(b.name));
+  const filteredLocations = sortedLocations.filter((l) => l.name.toLowerCase().includes(locQuery.toLowerCase()));
 
   return (
     <div>
@@ -1203,10 +1359,27 @@ function PointsEditor({ charId, points, locations, onAdd, onUpdate, onRemove, on
 
       <div className="space-y-2 text-xs border-t border-[#3a3a44] pt-2">
         <div className="text-[#8f8a7f]">Add point without clicking the map:</div>
-        <select value={locId} onChange={(e) => setLocId(e.target.value)} className="w-full bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1.5">
-          <option value="">Location…</option>
-          {sortedLocations.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
-        </select>
+        <div className="relative">
+          <input
+            value={locQuery}
+            onChange={(e) => { setLocQuery(e.target.value); setLocId(""); setShowLocDropdown(true); }}
+            onFocus={() => setShowLocDropdown(true)}
+            onBlur={() => setShowLocDropdown(false)}
+            placeholder="Search location…"
+            className="w-full bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1.5"
+          />
+          {showLocDropdown && (
+            <div className="absolute z-10 w-full max-h-40 overflow-y-auto bg-[#1c1c22] border border-[#3a3a44] rounded mt-1 shadow-lg">
+              {filteredLocations.length === 0 && <div className="px-2 py-1.5 text-[#8f8a7f] italic">no matches</div>}
+              {filteredLocations.map((l) => (
+                <div key={l.id}
+                  onMouseDown={(e) => { e.preventDefault(); setLocId(l.id); setLocQuery(l.name); setShowLocDropdown(false); }}
+                  className="px-2 py-1.5 cursor-pointer hover:bg-[#2a2a32]"
+                >{l.name}</div>
+              ))}
+            </div>
+          )}
+        </div>
         <div className="flex items-center gap-2">
           <span className="text-[#8f8a7f]">days</span>
           <input type="number" value={startDay} onChange={(e) => setStartDay(parseInt(e.target.value) || 1)} className="w-16 bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1" />
@@ -1214,7 +1387,7 @@ function PointsEditor({ charId, points, locations, onAdd, onUpdate, onRemove, on
           <input type="number" value={endDay} onChange={(e) => setEndDay(parseInt(e.target.value) || 1)} className="w-16 bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1" />
         </div>
         <textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="What's happening…" className="w-full bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1.5 h-14" />
-        <button disabled={!locId} onClick={() => { onAdd(charId, locId, startDay, endDay, note); setLocId(""); setNote(""); }}
+        <button disabled={!locId} onClick={() => { onAdd(charId, locId, startDay, endDay, note); setLocId(""); setLocQuery(""); setNote(""); }}
           className="px-2 py-1 border border-[#3a3a44] rounded hover:border-[#8f8a7f] disabled:opacity-30">Add point</button>
       </div>
     </div>
