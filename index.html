@@ -32,6 +32,7 @@ const PALETTE = ["#e0555f", "#e8a33d", "#4fb8a0", "#5c8be0", "#b47ede", "#e07ab0
 const uid = () => Math.random().toString(36).slice(2, 10);
 
 const emptyData = {
+  mapImage: null,  // data URL for a custom map background; falls back to MAP_IMAGE when null
   locations: [],   // {id, name, x, y} — named nodes
   junctions: [],   // {id, x, y} — unnamed fork points along the path network
   segments: [],    // {id, name, fromNodeId, toNodeId, points:[{x,y}], miles}
@@ -47,6 +48,34 @@ const emptyData = {
     { id: "airship", name: "Airship", speed: 150, segType: "air" },
   ],
 };
+
+// downscale an uploaded image file and return it as a webp data URL, so custom
+// map backgrounds don't balloon the synced JSON row with a multi-MB original
+function resizeImageToDataUrl(file, maxDim) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > maxDim || height > maxDim) {
+          const scale = maxDim / Math.max(width, height);
+          width = Math.round(width * scale);
+          height = Math.round(height * scale);
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL("image/webp", 0.9));
+      };
+      img.onerror = () => reject(new Error("Couldn't decode image"));
+      img.src = reader.result;
+    };
+    reader.onerror = () => reject(new Error("Couldn't read file"));
+    reader.readAsDataURL(file);
+  });
+}
 
 function migrateData(raw) {
   const d = { ...emptyData, ...raw };
@@ -306,7 +335,7 @@ function calculateTravel(data, fromId, toId, modeId) {
     if (airPath) {
       return { miles: airPath.rawMiles, days: Math.max(0.25, roundToQuarterDay(airPath.effectiveMiles / mode.speed)), note: "flying a drawn air route", highlightPoints: pointsFromHops(data, airPath.hops) };
     }
-    const a = data.locations.find((l) => l.id === fromId), b = data.locations.find((l) => l.id === toId);
+    const a = nodeById(data, fromId), b = nodeById(data, toId);
     if (!a || !b) return null;
     if (!data.calibration) return { note: "set the map scale first (Calibrate scale)" };
     const miles = dist(a, b) * data.calibration.milesPerPixel;
@@ -328,13 +357,13 @@ function mapPositionForChar(data, charId, day) {
   for (let i = 0; i < pts.length; i++) {
     const p = pts[i];
     if (day >= p.startDay && day <= p.endDay) {
-      const loc = data.locations.find((l) => l.id === p.locationId);
-      return loc ? { x: loc.x, y: loc.y, label: loc.name, note: p.note } : null;
+      const loc = nodeById(data, p.locationId);
+      return loc ? { x: loc.x, y: loc.y, label: nodeLabel(data, p.locationId), note: p.note } : null;
     }
     const next = pts[i + 1];
     if (next && day > p.endDay && day < next.startDay && p.locationId !== next.locationId) {
-      const fromLoc = data.locations.find((l) => l.id === p.locationId);
-      const toLoc = data.locations.find((l) => l.id === next.locationId);
+      const fromLoc = nodeById(data, p.locationId);
+      const toLoc = nodeById(data, next.locationId);
       if (!fromLoc || !toLoc) return null;
       const t = (day - p.endDay) / (next.startDay - p.endDay);
       const pathPts = concatenatedPathPoints(data, p.locationId, next.locationId);
@@ -356,17 +385,111 @@ function stationedLocation(data, charId, day) {
 }
 
 function SetupScreen({ onOpen }) {
-  const [val, setVal] = useState("");
+  const [existingMaps, setExistingMaps] = useState([]);
+  const [loadingList, setLoadingList] = useState(true);
+  const [listError, setListError] = useState(false);
+  const [choice, setChoice] = useState("");
+  const [manualName, setManualName] = useState("");
+  const [newMapName, setNewMapName] = useState("");
+  const [newMapImage, setNewMapImage] = useState(null);
+  const [imageProcessing, setImageProcessing] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const { data, error } = await supabase.from(TABLE).select("id").order("id");
+        if (error) throw error;
+        setExistingMaps((data || []).map((r) => r.id));
+      } catch (err) {
+        setListError(true);
+      }
+      setLoadingList(false);
+    })();
+  }, []);
+
+  async function handleImageFile(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    setImageProcessing(true);
+    try {
+      setNewMapImage(await resizeImageToDataUrl(file, 3000));
+    } catch (err) {
+      alert("Couldn't read that image — try a different file.");
+    }
+    setImageProcessing(false);
+  }
+
+  function handleOpen() {
+    if (choice === "__new__") {
+      const name = newMapName.trim();
+      if (!name) return;
+      onOpen(name, newMapImage ? { mapImage: newMapImage } : null);
+    } else if (choice) {
+      onOpen(choice, null);
+    } else if (manualName.trim()) {
+      onOpen(manualName.trim(), null);
+    }
+  }
+
+  const canOpen = choice === "__new__" ? newMapName.trim().length > 0 : choice ? true : manualName.trim().length > 0;
+
+  if (listError) {
+    // fall back to the simple original flow if we can't reach the map list
+    return (
+      <div className="min-h-screen bg-[#15151a] text-[#ece7dd] flex items-center justify-center px-6">
+        <div className="max-w-sm w-full">
+          <h1 className="text-2xl mb-2" style={{ fontFamily: "Georgia, serif" }}>Ieldohr Story Map</h1>
+          <p className="text-sm text-[#8f8a7f] font-mono mb-6">Couldn't load your map list — enter a map name directly. Use the same one on every device to sync.</p>
+          <input value={manualName} onChange={(e) => setManualName(e.target.value)} placeholder="e.g. ieldohr-main"
+            className="w-full bg-[#1c1c22] border border-[#3a3a44] rounded px-3 py-2 text-sm mb-3"
+            onKeyDown={(e) => e.key === "Enter" && manualName.trim() && onOpen(manualName.trim(), null)} />
+          <button onClick={() => manualName.trim() && onOpen(manualName.trim(), null)}
+            className="w-full px-3 py-2 text-sm border border-[#3a3a44] rounded hover:border-[#8f8a7f] transition">Open map</button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-[#15151a] text-[#ece7dd] flex items-center justify-center px-6">
       <div className="max-w-sm w-full">
         <h1 className="text-2xl mb-2" style={{ fontFamily: "Georgia, serif" }}>Ieldohr Story Map</h1>
-        <p className="text-sm text-[#8f8a7f] font-mono mb-6">Enter a map name. Use the same one on every device to sync.</p>
-        <input value={val} onChange={(e) => setVal(e.target.value)} placeholder="e.g. ieldohr-main"
-          className="w-full bg-[#1c1c22] border border-[#3a3a44] rounded px-3 py-2 text-sm mb-3"
-          onKeyDown={(e) => e.key === "Enter" && val.trim() && onOpen(val.trim())} />
-        <button onClick={() => val.trim() && onOpen(val.trim())}
-          className="w-full px-3 py-2 text-sm border border-[#3a3a44] rounded hover:border-[#8f8a7f] transition">Open map</button>
+        <p className="text-sm text-[#8f8a7f] font-mono mb-6">Choose a map to open, or create a new one.</p>
+
+        {loadingList ? (
+          <p className="text-xs text-[#8f8a7f] font-mono mb-3">loading your maps…</p>
+        ) : (
+          <select value={choice} onChange={(e) => setChoice(e.target.value)}
+            className="w-full bg-[#1c1c22] border border-[#3a3a44] rounded px-3 py-2 text-sm mb-3">
+            <option value="">Select a map…</option>
+            {existingMaps.map((id) => <option key={id} value={id}>{id}</option>)}
+            <option value="__new__">+ Create new map</option>
+          </select>
+        )}
+
+        {choice === "__new__" && (
+          <div className="space-y-2 mb-3 border border-[#3a3a44] rounded p-3">
+            <input value={newMapName} onChange={(e) => setNewMapName(e.target.value)} placeholder="New map name, e.g. my-second-world"
+              className="w-full bg-[#1c1c22] border border-[#3a3a44] rounded px-3 py-2 text-sm"
+              onKeyDown={(e) => e.key === "Enter" && canOpen && handleOpen()} />
+            <div className="text-xs text-[#8f8a7f]">Map image (optional — you can skip this for now)</div>
+            <input type="file" accept="image/*" onChange={handleImageFile} className="text-xs text-[#8f8a7f]" />
+            {imageProcessing && <p className="text-xs text-[#8f8a7f]">processing image…</p>}
+            {newMapImage && <img src={newMapImage} alt="preview" className="w-full rounded border border-[#3a3a44] mt-1" />}
+          </div>
+        )}
+
+        {!loadingList && choice === "" && (
+          <>
+            <div className="text-xs text-[#8f8a7f] mb-1">Or enter a map name directly:</div>
+            <input value={manualName} onChange={(e) => setManualName(e.target.value)} placeholder="e.g. ieldohr-main"
+              className="w-full bg-[#1c1c22] border border-[#3a3a44] rounded px-3 py-2 text-sm mb-3"
+              onKeyDown={(e) => e.key === "Enter" && canOpen && handleOpen()} />
+          </>
+        )}
+
+        <button onClick={handleOpen} disabled={!canOpen}
+          className="w-full px-3 py-2 text-sm border border-[#3a3a44] rounded hover:border-[#8f8a7f] transition disabled:opacity-30">Open map</button>
       </div>
     </div>
   );
@@ -380,6 +503,7 @@ function App() {
   const [configError, setConfigError] = useState(false);
   const saveTimer = useRef(null);
   const firstLoad = useRef(true);
+  const pendingSeedRef = useRef(null);
 
   const [mode, setMode] = useState("view"); // view | calibrate | pin | route | point
   const [calibPoints, setCalibPoints] = useState([]);
@@ -388,7 +512,7 @@ function App() {
   const [editingPointId, setEditingPointId] = useState(null);
   const [day, setDay] = useState(1);
   const [playing, setPlaying] = useState(false);
-  const [showLabels, setShowLabels] = useState(true);
+  const [labelMode, setLabelMode] = useState("all"); // "all" | "locations" | "forks" | "none"
   const [highlightPath, setHighlightPath] = useState(null);
   const [selectedNodeId, setSelectedNodeId] = useState(null);
 
@@ -429,7 +553,12 @@ function App() {
     (async () => {
       const { data: row } = await supabase.from(TABLE).select("*").eq("id", mapId).single();
       if (row) setData(migrateData(row.data));
-      else { await supabase.from(TABLE).insert({ id: mapId, data: emptyData }); setData(emptyData); }
+      else {
+        const seedData = { ...emptyData, ...(pendingSeedRef.current || {}) };
+        await supabase.from(TABLE).insert({ id: mapId, data: seedData });
+        setData(seedData);
+      }
+      pendingSeedRef.current = null;
       firstLoad.current = true;
       setLoaded(true);
     })();
@@ -466,8 +595,8 @@ function App() {
     return () => window.removeEventListener("resize", update);
   }, [dayWidth, data.points, data.characters.length]);
 
-  function openMap(id) { localStorage.setItem("storyWorldId", id); setMapId(id); }
-  function switchMap() { localStorage.removeItem("storyWorldId"); setMapId(null); setLoaded(false); setData(emptyData); }
+  function openMap(id, seed) { localStorage.setItem("storyWorldId", id); pendingSeedRef.current = seed || null; setMapId(id); }
+  function switchMap() { localStorage.removeItem("storyWorldId"); pendingSeedRef.current = null; setMapId(null); setLoaded(false); setData(emptyData); }
   function update(patch) { setData((d) => ({ ...d, ...patch })); }
 
   function exportData() {
@@ -501,10 +630,10 @@ function App() {
           lastDay = p.startDay;
         }
         const ch = data.characters.find((c) => c.id === p.characterId);
-        const loc = data.locations.find((l) => l.id === p.locationId);
+        const locLabel = nodeLabel(data, p.locationId);
         const span = p.endDay !== p.startDay ? ` (through day ${p.endDay})` : "";
         const noteText = p.note ? `: ${p.note}` : "";
-        lines.push(`  ${ch?.name || "?"} — ${loc?.name || "?"}${span}${noteText}`);
+        lines.push(`  ${ch?.name || "?"} — ${locLabel}${span}${noteText}`);
       });
     }
     const blob = new Blob([lines.join("\n")], { type: "text/plain" });
@@ -666,7 +795,9 @@ function App() {
     const used = new Set();
     remaining.forEach((s) => { used.add(s.fromNodeId); used.add(s.toNodeId); });
     const remainingJunctions = (data.junctions || []).filter((j) => used.has(j.id));
-    update({ segments: remaining, junctions: remainingJunctions });
+    const droppedJunctionIds = new Set((data.junctions || []).filter((j) => !used.has(j.id)).map((j) => j.id));
+    const remainingPoints = droppedJunctionIds.size > 0 ? data.points.filter((p) => !droppedJunctionIds.has(p.locationId)) : data.points;
+    update({ segments: remaining, junctions: remainingJunctions, points: remainingPoints });
   }
 
   function removeLocation(id) {
@@ -718,7 +849,7 @@ function App() {
   function addPointForm(charId, locationId, startDay, endDay, note) {
     const overlaps = overlappingPointsFor(charId, startDay, endDay, null);
     if (overlaps.length > 0) {
-      const list = overlaps.map((p) => `day ${p.startDay}${p.endDay !== p.startDay ? `–${p.endDay}` : ""} at ${data.locations.find(l => l.id === p.locationId)?.name || "?"}`).join(", ");
+      const list = overlaps.map((p) => `day ${p.startDay}${p.endDay !== p.startDay ? `–${p.endDay}` : ""} at ${nodeLabel(data, p.locationId)}`).join(", ");
       if (!confirm(`This overlaps this character's existing point(s): ${list}.\n\nOverlapping day ranges can make the thread diagram behave oddly. Add it anyway?`)) return;
     }
     update({ points: [...data.points, { id: uid(), characterId: charId, locationId, startDay, endDay, note }] });
@@ -728,8 +859,7 @@ function App() {
   }
   function removePoint(pointId) {
     const p = data.points.find((pt) => pt.id === pointId);
-    const loc = p ? data.locations.find((l) => l.id === p.locationId) : null;
-    const label = p ? `the point at "${loc?.name || "?"}" (day ${p.startDay}${p.endDay !== p.startDay ? `–${p.endDay}` : ""})` : "this point";
+    const label = p ? `the point at "${nodeLabel(data, p.locationId)}" (day ${p.startDay}${p.endDay !== p.startDay ? `–${p.endDay}` : ""})` : "this point";
     if (!confirm(`Delete ${label}?`)) return;
     update({ points: data.points.filter((pt) => pt.id !== pointId) });
     if (editingPointId === pointId) setEditingPointId(null);
@@ -810,7 +940,7 @@ function App() {
       const info = laneYFor(p.characterId, p.startDay);
       const y = info ? info.y : TOP_PAD + homeLane(p.characterId) * LANE_H;
       const x = LEFT_PAD + (p.startDay - breaks[0]) * dayWidth;
-      const locName = data.locations.find((l) => l.id === p.locationId)?.name || "";
+      const locName = nodeLabel(data, p.locationId);
       const entry = { pointId: p.id, color: ch.color, note: p.note, charName: ch.name, locName, startDay: p.startDay, endDay: p.endDay };
       const key = `${Math.round(x)}_${Math.round(y)}`;
       if (!markerGroups.has(key)) markerGroups.set(key, { x, y, members: [] });
@@ -892,7 +1022,12 @@ function App() {
                 <span className="px-1 text-[#8f8a7f]">{Math.round(zoom * 100)}%</span>
                 <button onClick={() => setZoom((z) => clampZoom(z + 0.4))} className="px-2 py-1 border border-[#3a3a44] rounded hover:border-[#8f8a7f]">+</button>
                 <button onClick={resetView} className="px-2 py-1 border border-[#3a3a44] rounded hover:border-[#8f8a7f]">Reset view</button>
-                <button onClick={() => setShowLabels((s) => !s)} className="px-2 py-1 border border-[#3a3a44] rounded hover:border-[#8f8a7f]">{showLabels ? "Hide" : "Show"} names</button>
+                <select value={labelMode} onChange={(e) => setLabelMode(e.target.value)} className="px-2 py-1 border border-[#3a3a44] rounded bg-[#1c1c22] hover:border-[#8f8a7f]">
+                  <option value="all">Show all names</option>
+                  <option value="locations">Locations only</option>
+                  <option value="forks">Forks only</option>
+                  <option value="none">Hide all names</option>
+                </select>
               </span>
             </div>
 
@@ -907,7 +1042,7 @@ function App() {
               onMouseLeave={onMapMouseUp}
             >
               <div style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, transformOrigin: "0 0", width: "100%", position: "relative" }}>
-                <img ref={imgRef} src={MAP_IMAGE} alt="map" className="w-full block select-none" draggable={false} onClick={handleMapClick} />
+                <img ref={imgRef} src={data.mapImage || MAP_IMAGE} alt="map" className="w-full block select-none" draggable={false} onClick={handleMapClick} />
                 <svg className="absolute inset-0 w-full h-full pointer-events-none" viewBox="0 0 100 100" preserveAspectRatio="none">
                   {data.segments.map((r) => {
                     const type = r.type || "land";
@@ -941,11 +1076,11 @@ function App() {
                     );
                   })()}
                 </svg>
-                {showLabels && data.locations.map((l) => (
+                {(labelMode === "all" || labelMode === "locations") && data.locations.map((l) => (
                   <div key={l.id} className="absolute text-[10px] font-mono text-[#ece7dd] bg-[#15151a]/70 px-1 rounded pointer-events-none"
                     style={{ left: `${l.x}%`, top: `${l.y}%`, transform: "translate(6px, -50%)" }}>{l.name}</div>
                 ))}
-                {showLabels && (data.junctions || []).filter((j) => j.name && j.name.trim()).map((j) => (
+                {(labelMode === "all" || labelMode === "forks") && (data.junctions || []).filter((j) => j.name && j.name.trim()).map((j) => (
                   <div key={j.id} className="absolute text-[10px] font-mono text-[#e8a33d] bg-[#15151a]/70 px-1 rounded pointer-events-none"
                     style={{ left: `${j.x}%`, top: `${j.y}%`, transform: "translate(6px, -50%)" }}>{j.name}</div>
                 ))}
@@ -956,7 +1091,7 @@ function App() {
             {editingPoint && (
               <div className="mt-3 border border-[#4fb8a0] rounded p-3 text-xs space-y-2">
                 <div className="flex items-center justify-between">
-                  <span className="font-mono text-[#8f8a7f]">Editing point at {data.locations.find(l=>l.id===editingPoint.locationId)?.name}</span>
+                  <span className="font-mono text-[#8f8a7f]">Editing point at {nodeLabel(data, editingPoint.locationId)}</span>
                   <button onClick={() => setEditingPointId(null)} className="text-[#8f8a7f] hover:text-[#ece7dd]">done ✕</button>
                 </div>
                 <div className="flex items-center gap-2">
@@ -968,7 +1103,7 @@ function App() {
                 {(() => {
                   const overlaps = overlappingPointsFor(editingPoint.characterId, editingPoint.startDay, editingPoint.endDay, editingPoint.id);
                   if (overlaps.length === 0) return null;
-                  const list = overlaps.map((p) => `day ${p.startDay}${p.endDay !== p.startDay ? `–${p.endDay}` : ""} at ${data.locations.find(l => l.id === p.locationId)?.name || "?"}`).join(", ");
+                  const list = overlaps.map((p) => `day ${p.startDay}${p.endDay !== p.startDay ? `–${p.endDay}` : ""} at ${nodeLabel(data, p.locationId)}`).join(", ");
                   return <p className="text-[#e8a33d]">⚠ overlaps this character's other point(s): {list}</p>;
                 })()}
                 <textarea value={editingPoint.note} onChange={(e) => updatePoint(editingPoint.id, { note: e.target.value })} placeholder="What's happening here…" className="w-full bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1.5 h-16" />
@@ -1125,6 +1260,7 @@ function App() {
                 charId={selectedChar}
                 points={pointsForChar(data, selectedChar)}
                 locations={data.locations}
+                junctions={data.junctions || []}
                 onAdd={addPointForm}
                 onUpdate={updatePoint}
                 onRemove={removePoint}
@@ -1264,7 +1400,14 @@ function TravelCalculator({ data, highlightPath, onHighlight }) {
   const [toId, setToId] = useState("");
   const [modeId, setModeId] = useState(data.travelModes[0]?.id || "");
   const [result, setResult] = useState(null);
+  const [includeForksAsDest, setIncludeForksAsDest] = useState(false);
   const sortedLocations = [...data.locations].sort((a, b) => a.name.localeCompare(b.name));
+  const namedJunctions = (data.junctions || []).filter((j) => j.name && j.name.trim()).sort((a, b) => a.name.localeCompare(b.name));
+
+  function toggleIncludeForks(checked) {
+    setIncludeForksAsDest(checked);
+    if (!checked && (data.junctions || []).some((j) => j.id === toId)) setToId("");
+  }
 
   function calc() {
     const r = calculateTravel(data, fromId, toId, modeId);
@@ -1282,8 +1425,25 @@ function TravelCalculator({ data, highlightPath, onHighlight }) {
         </select>
         <select value={toId} onChange={(e) => setToId(e.target.value)} className="w-full bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1.5">
           <option value="">To…</option>
-          {sortedLocations.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
+          {includeForksAsDest ? (
+            <>
+              <optgroup label="Locations">
+                {sortedLocations.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
+              </optgroup>
+              {namedJunctions.length > 0 && (
+                <optgroup label="Named forks">
+                  {namedJunctions.map((j) => <option key={j.id} value={j.id}>{j.name}</option>)}
+                </optgroup>
+              )}
+            </>
+          ) : (
+            sortedLocations.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)
+          )}
         </select>
+        <label className="flex items-center gap-1.5 text-[#8f8a7f]">
+          <input type="checkbox" checked={includeForksAsDest} onChange={(e) => toggleIncludeForks(e.target.checked)} />
+          Allow named forks as destination
+        </label>
         <select value={modeId} onChange={(e) => setModeId(e.target.value)} className="w-full bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1.5">
           <option value="fastest">Fastest available (mix modes)</option>
           {data.travelModes.map((m) => <option key={m.id} value={m.id}>{m.name} ({m.speed}mi/day)</option>)}
@@ -1327,16 +1487,31 @@ function TravelCalculator({ data, highlightPath, onHighlight }) {
   );
 }
 
-function PointsEditor({ charId, points, locations, onAdd, onUpdate, onRemove, onEdit, onClose }) {
+function PointsEditor({ charId, points, locations, junctions, onAdd, onUpdate, onRemove, onEdit, onClose }) {
   const [locId, setLocId] = useState("");
   const [locQuery, setLocQuery] = useState("");
   const [showLocDropdown, setShowLocDropdown] = useState(false);
+  const [includeForks, setIncludeForks] = useState(false);
   const [startDay, setStartDay] = useState(1);
   const [endDay, setEndDay] = useState(1);
   const [note, setNote] = useState("");
-  const locName = (id) => locations.find((l) => l.id === id)?.name || "?";
+  const labelFor = (id) => {
+    const loc = locations.find((l) => l.id === id);
+    if (loc) return loc.name;
+    const idx = junctions.findIndex((j) => j.id === id);
+    if (idx === -1) return "?";
+    const j = junctions[idx];
+    return j.name && j.name.trim() ? j.name.trim() : `Fork ${idx + 1}`;
+  };
   const sortedLocations = [...locations].sort((a, b) => a.name.localeCompare(b.name));
+  const namedJunctions = junctions.filter((j) => j.name && j.name.trim()).sort((a, b) => a.name.localeCompare(b.name));
   const filteredLocations = sortedLocations.filter((l) => l.name.toLowerCase().includes(locQuery.toLowerCase()));
+  const filteredForks = includeForks ? namedJunctions.filter((j) => j.name.toLowerCase().includes(locQuery.toLowerCase())) : [];
+
+  function toggleIncludeForks(checked) {
+    setIncludeForks(checked);
+    if (!checked && junctions.some((j) => j.id === locId)) { setLocId(""); setLocQuery(""); }
+  }
 
   return (
     <div>
@@ -1348,7 +1523,7 @@ function PointsEditor({ charId, points, locations, onAdd, onUpdate, onRemove, on
         {points.map((p) => (
           <div key={p.id} className="border border-[#3a3a44] rounded px-2 py-2 text-xs">
             <div className="flex items-center justify-between mb-1">
-              <span onClick={() => onEdit(p.id)} className="cursor-pointer hover:underline">{locName(p.locationId)} · day {p.startDay}{p.endDay !== p.startDay ? `–${p.endDay}` : ""}</span>
+              <span onClick={() => onEdit(p.id)} className="cursor-pointer hover:underline">{labelFor(p.locationId)} · day {p.startDay}{p.endDay !== p.startDay ? `–${p.endDay}` : ""}</span>
               <button onClick={() => onRemove(p.id)} className="text-[#8f8a7f] hover:text-[#e0555f]">✕</button>
             </div>
             {p.note && <div className="text-[#8f8a7f] italic">{p.note}</div>}
@@ -1369,17 +1544,37 @@ function PointsEditor({ charId, points, locations, onAdd, onUpdate, onRemove, on
             className="w-full bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1.5"
           />
           {showLocDropdown && (
-            <div className="absolute z-10 w-full max-h-40 overflow-y-auto bg-[#1c1c22] border border-[#3a3a44] rounded mt-1 shadow-lg">
-              {filteredLocations.length === 0 && <div className="px-2 py-1.5 text-[#8f8a7f] italic">no matches</div>}
-              {filteredLocations.map((l) => (
-                <div key={l.id}
-                  onMouseDown={(e) => { e.preventDefault(); setLocId(l.id); setLocQuery(l.name); setShowLocDropdown(false); }}
-                  className="px-2 py-1.5 cursor-pointer hover:bg-[#2a2a32]"
-                >{l.name}</div>
-              ))}
+            <div className="absolute z-10 w-full max-h-48 overflow-y-auto bg-[#1c1c22] border border-[#3a3a44] rounded mt-1 shadow-lg">
+              {filteredLocations.length === 0 && filteredForks.length === 0 && <div className="px-2 py-1.5 text-[#8f8a7f] italic">no matches</div>}
+              {filteredLocations.length > 0 && (
+                <div>
+                  {includeForks && <div className="px-2 pt-1.5 pb-0.5 text-[10px] uppercase tracking-wide text-[#8f8a7f]">Locations</div>}
+                  {filteredLocations.map((l) => (
+                    <div key={l.id}
+                      onMouseDown={(e) => { e.preventDefault(); setLocId(l.id); setLocQuery(l.name); setShowLocDropdown(false); }}
+                      className="px-2 py-1.5 cursor-pointer hover:bg-[#2a2a32]"
+                    >{l.name}</div>
+                  ))}
+                </div>
+              )}
+              {filteredForks.length > 0 && (
+                <div>
+                  <div className="px-2 pt-1.5 pb-0.5 text-[10px] uppercase tracking-wide text-[#8f8a7f]">Named forks</div>
+                  {filteredForks.map((j) => (
+                    <div key={j.id}
+                      onMouseDown={(e) => { e.preventDefault(); setLocId(j.id); setLocQuery(j.name); setShowLocDropdown(false); }}
+                      className="px-2 py-1.5 cursor-pointer hover:bg-[#2a2a32]"
+                    >{j.name}</div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
         </div>
+        <label className="flex items-center gap-1.5 text-[#8f8a7f]">
+          <input type="checkbox" checked={includeForks} onChange={(e) => toggleIncludeForks(e.target.checked)} />
+          Include named forks
+        </label>
         <div className="flex items-center gap-2">
           <span className="text-[#8f8a7f]">days</span>
           <input type="number" value={startDay} onChange={(e) => setStartDay(parseInt(e.target.value) || 1)} className="w-16 bg-[#1c1c22] border border-[#3a3a44] rounded px-2 py-1" />
