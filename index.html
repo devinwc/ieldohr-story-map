@@ -19,9 +19,9 @@ const { useState, useEffect, useMemo, useRef } = React;
 // ---------------------------------------------------------------
 // SUPABASE CONFIG
 // ---------------------------------------------------------------
-const SUPABASE_URL = "https://qusqdgagnmsghysuidau.supabase.co";
-const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InF1c3FkZ2Fnbm1zZ2h5c3VpZGF1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM5ODYxMjgsImV4cCI6MjA5OTU2MjEyOH0.i8PfGYpjnzQlmrtSuf22snJIu2GD0p_NX2ztu5zlCrY";
-const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const SUPABASE_URL = 'http://192.168.0.21:8000';
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzg3Nzg1NzY3LCJleHAiOjE5NDU0NjU3Njd9.ZtIg8TEtBJXBnFA8EJx9hDOaYGZBoiOy5fwXoI_j038";
+   const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { db: { schema: 'ieldohr' } });
 const TABLE = "story_world";
 
 const MAP_IMAGE = "Ieldohr_Map.webp";
